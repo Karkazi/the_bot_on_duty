@@ -1,0 +1,22 @@
+# Telegram
+aiogram>=3.12.0
+
+# MAX
+maxapi>=0.9.0
+brotlicffi>=1.1.0
+
+# HTTP & env
+aiohttp>=3.9.0
+python-dotenv>=1.0.0
+requests>=2.31.0
+
+# Models & config
+pydantic>=2.0.0
+
+# Build (optional)
+pyinstaller>=6.3.0
+
+# Tests
+pytest>=7.0.0
+pytest-asyncio>=0.23.0
+pytest-cov>=4.0.0
