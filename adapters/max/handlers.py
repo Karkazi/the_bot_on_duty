@@ -37,6 +37,7 @@ from adapters.max.keyboards import (
     regular_photo_skip_keyboard,
     maintenance_time_method_keyboard,
     create_time_spinner_keyboard_max,
+    cal_notify_keyboard,
 )
 
 if TYPE_CHECKING:
@@ -215,6 +216,8 @@ def _resolve_attachments(attachments) -> Optional[list]:
         return regular_photo_skip_keyboard()
     if attachments == "maintenance_time_method_keyboard":
         return maintenance_time_method_keyboard()
+    if attachments == "cal_notify_keyboard":
+        return cal_notify_keyboard()
     return back_only()
 
 
@@ -421,6 +424,85 @@ async def _handle_max_spinner_callback(event, uid: int, payload: str) -> None:
         return
 
 
+async def _execute_cal_work(event, uid: int) -> None:
+    """Записывает работу в Confluence и уведомляет Calendar-admin-ов как о новой записи."""
+    from adapters.max.sessions import get_session, clear_session
+    from datetime import datetime as _dt
+    sess = get_session(uid)
+    data = (sess or {}).get("data", {})
+    clear_session(uid)
+
+    description = data.get("description", "не указано")
+    start_time_raw = data.get("start_time")
+    end_time_raw = data.get("end_time")
+    unavailable_services = data.get("unavailable_services", "не указано")
+    tech_description = data.get("cal_tech_description", description)
+    cal_notify = data.get("cal_notify", "Нет")
+
+    if not start_time_raw or not end_time_raw:
+        await _reply_max_callback(event, uid, "❌ Ошибка: данные сессии неполны.", main_menu())
+        return
+
+    try:
+        start_dt = _dt.fromisoformat(start_time_raw)
+        end_dt = _dt.fromisoformat(end_time_raw)
+    except Exception:
+        await _reply_max_callback(event, uid, "❌ Ошибка разбора времени.", main_menu())
+        return
+
+    from services.confluence_service import get_confluence_page_id, append_work_to_confluence_table, _make_work_id
+    from domain.constants import DATETIME_FORMAT
+
+    page_id = get_confluence_page_id()
+    work_data = {
+        "description": description,
+        "start_time": start_dt,
+        "end_time": end_dt,
+        "unavailable_services": unavailable_services,
+        "cal_tech_description": tech_description,
+        "cal_notify": cal_notify,
+        "owner": "Дежурный СА",
+    }
+
+    await _reply_max_callback(event, uid, "⏳ Записываю в Confluence...", None)
+    ok = await append_work_to_confluence_table(page_id, work_data)
+    if not ok:
+        await _reply_max_callback(event, uid, "❌ Не удалось записать в Confluence. Проверьте логи.", main_menu())
+        return
+
+    start_time_str = start_dt.strftime(DATETIME_FORMAT)
+    end_time_str = end_dt.strftime(DATETIME_FORMAT)
+    work_id = _make_work_id(description, start_time_str, end_time_str)
+
+    from bot_state import bot_state
+    row = {
+        "work_id": work_id,
+        "description": description,
+        "start_time_str": start_time_str,
+        "end_time_str": end_time_str,
+        "unavailable_services": unavailable_services,
+        "owner": "Дежурный СА",
+        "notify": cal_notify,
+        "start_time": start_dt,
+        "end_time": end_dt,
+    }
+    bot_state.known_maintenances_from_confluence[work_id] = {
+        **row,
+        "status": "no_notify" if cal_notify.lower() in ("нет", "no", "none", "-") else "pending_decision",
+    }
+    await bot_state.save_state()
+
+    from handlers.manage.confluence_calendar import notify_admins_about_work
+    await notify_admins_about_work(row)
+
+    await _reply_max_callback(
+        event, uid,
+        f"✅ Работа добавлена в Confluence (ID: {work_id[:8]}).\n"
+        f"Уведомления отправлены администраторам календаря.",
+        main_menu(),
+    )
+
+
 def _register_handlers(dp):
     """Регистрирует обработчики в диспетчере maxapi."""
     from maxapi.types import MessageCreated, Command
@@ -511,7 +593,9 @@ def _register_handlers(dp):
             except Exception as e:
                 logger.warning("MAX callback: не удалось отправить ответ (user unknown): %s", e)
             return
-        if not is_max_admin(uid):
+        calendar_admin_ids = CONFIG.get("MAX", {}).get("CALENDAR_ADMIN_IDS") or []
+        allowed = is_max_admin(uid) or (payload.startswith("conf_") and uid in calendar_admin_ids)
+        if not allowed:
             try:
                 await event.message.answer(
                     "❌ У вас нет прав для управления ботом из MAX. Обратитесь к администратору."
@@ -538,7 +622,7 @@ def _register_handlers(dp):
         # Старт спиннеров времени (после "Спиннеры" на шаге enter_start_time)
         if payload == "maint_time_spinners":
             sess = get_session(uid)
-            if sess and sess.get("step") == "enter_start_time" and (sess.get("data") or {}).get("type") == "maintenance":
+            if sess and sess.get("step") == "enter_start_time" and (sess.get("data") or {}).get("type") in ("maintenance", "cal_work"):
                 from domain.constants import MAINTENANCE_TIME_STEPS_ORDER
                 spinner_data = {
                     "date": 0,
@@ -565,7 +649,7 @@ def _register_handlers(dp):
 
         if payload == "maint_time_manual":
             sess = get_session(uid)
-            if sess and sess.get("step") == "enter_start_time" and (sess.get("data") or {}).get("type") == "maintenance":
+            if sess and sess.get("step") == "enter_start_time" and (sess.get("data") or {}).get("type") in ("maintenance", "cal_work"):
                 await _reply_max_callback(
                     event, uid,
                     "⏰ Введите дату и время начала:\n"
@@ -619,6 +703,118 @@ def _register_handlers(dp):
                 clear_manage_session(uid)
                 await _reply_max_callback(event, uid, "Выберите действие:", main_menu())
             return
+
+        # Запрос по новой работе из Confluence: Не информировать
+        if payload.startswith("conf_skip_"):
+            work_id = payload.replace("conf_skip_", "", 1)
+            entry = bot_state.known_maintenances_from_confluence.get(work_id)
+            if entry is not None:
+                entry["status"] = "skipped_by_admin"
+                await bot_state.save_state()
+                await _reply_max_callback(event, uid, "Оповещение по этим работам отменено.", main_menu())
+            else:
+                await _reply_max_callback(event, uid, "Запрос устарел или уже обработан.", main_menu())
+            return
+
+        # Запрос по новой работе из Confluence: Информировать
+        if payload.startswith("conf_notify_"):
+            work_id = payload.replace("conf_notify_", "", 1)
+            entry = bot_state.known_maintenances_from_confluence.get(work_id)
+            if entry is None or entry.get("status") not in ("pending_decision",):
+                await _reply_max_callback(event, uid, "Запрос устарел или уже обработан.", main_menu())
+                return
+            try:
+                from core.creation import create_maintenance
+                start_time = entry.get("start_time")
+                end_time = entry.get("end_time")
+                if start_time is None or end_time is None:
+                    await _reply_max_callback(event, uid, "Ошибка данных работы.", main_menu())
+                    return
+                # Не трогаем работы, где окончание уже прошло
+                from datetime import datetime as _dt
+                if end_time <= _dt.now():
+                    entry["status"] = "expired"
+                    await bot_state.save_state()
+                    await _reply_max_callback(event, uid, "Работы уже завершились — оповещение не отправляем.", main_menu())
+                    return
+                # Оповещения: ТГ — только ТГ+MAX; Петлокал — только Петлокал; ТГ+Петлокал/Петлокал+ТГ — оба
+                notify = (entry.get("notify") or "").lower()
+                has_tg = "тг" in notify
+                has_petlocal = "петлокал" in notify or "petlocal" in notify
+                send_to_telegram_max = has_tg
+                publish_petlocal = has_petlocal
+                if not send_to_telegram_max and not publish_petlocal:
+                    await _reply_max_callback(event, uid, "В Оповещениях не указаны каналы (ТГ или Петлокал).", main_menu())
+                    return
+                data = {
+                    "description": entry.get("description", "не указано"),
+                    "start_time": start_time.isoformat() if hasattr(start_time, "isoformat") else start_time,
+                    "end_time": end_time.isoformat() if hasattr(end_time, "isoformat") else end_time,
+                    "unavailable_services": entry.get("unavailable_services", "не указано"),
+                    "send_to_telegram_max": send_to_telegram_max,
+                    "publish_petlocal": publish_petlocal,
+                }
+                async def _reply_fn(t: str, attachments=None):
+                    await _reply_max_callback(event, uid, t, attachments or main_menu())
+                ok = await create_maintenance(data, _telegram_bot, _reply_fn, uid)
+                if ok:
+                    entry["status"] = "notified"
+                    await bot_state.save_state()
+                    parts = []
+                    if send_to_telegram_max:
+                        parts.append("ТГ, MAX")
+                    if publish_petlocal:
+                        parts.append("Петлокал")
+                    ch = ", ".join(parts)
+                    await _reply_max_callback(event, uid, "Оповещения отправлены: " + ch, main_menu())
+                else:
+                    await _reply_max_callback(event, uid, "Не удалось оповестить. См. логи.", main_menu())
+            except Exception as e:
+                logger.exception("CONF_MAINT conf_notify: %s", e)
+                await _reply_max_callback(event, uid, "Ошибка при отправке оповещений. См. логи.", main_menu())
+            return
+
+        # Добавить в календарь работ: выбор каналов оповещения
+        if payload in ("cal_notify_none", "cal_notify_petlocal", "cal_notify_messengers", "cal_notify_both"):
+            sess = get_session(uid)
+            if not (sess and sess.get("step") == "select_cal_notify" and (sess.get("data") or {}).get("type") == "cal_work"):
+                await _reply_max_callback(event, uid, "Сессия устарела. Начните заново.", main_menu())
+                return
+            notify_map = {
+                "cal_notify_none": "Нет",
+                "cal_notify_petlocal": "Петлокал",
+                "cal_notify_messengers": "ТГ",
+                "cal_notify_both": "ТГ+Петлокал",
+            }
+            cal_notify = notify_map[payload]
+            update_session_data(uid, cal_notify=cal_notify)
+            set_session(uid, "cal_confirm")
+            data = get_session(uid).get("data", {})
+            from datetime import datetime as _dt
+            def _fmt(iso: str) -> str:
+                try:
+                    return _dt.fromisoformat(iso).strftime("%d.%m.%Y %H:%M")
+                except Exception:
+                    return iso
+            summary = (
+                f"📅 Проверьте данные перед добавлением в календарь:\n\n"
+                f"• Объект работ: {data.get('description', '—')}\n"
+                f"• Начало: {_fmt(data.get('start_time', ''))}\n"
+                f"• Окончание: {_fmt(data.get('end_time', ''))}\n"
+                f"• Недоступно: {data.get('unavailable_services', '—')}\n"
+                f"• Описание для тех. специалистов: {data.get('cal_tech_description', '—')}\n"
+                f"• Оповещения: {cal_notify}\n\n"
+                f"Добавить запись в Confluence?"
+            )
+            await _reply_max_callback(event, uid, summary, confirmation_keyboard())
+            return
+
+        # Добавить в календарь работ: подтверждение записи
+        if payload == "confirm_send":
+            sess = get_session(uid)
+            if sess and (sess.get("data") or {}).get("type") == "cal_work" and sess.get("step") == "cal_confirm":
+                await _execute_cal_work(event, uid)
+                return
 
         if payload == "manage_alarms":
             set_manage_session(uid, "alarm_list")
@@ -731,6 +927,11 @@ def _register_handlers(dp):
             async def reply_fn(t: str, attachments=None):
                 await _reply_max_callback(event, uid, t, attachments)
             await handle_create_message(event, reply_fn, uid, num, telegram_bot=_telegram_bot)
+            return
+
+        if payload == "msg_type_cal_work":
+            set_session(uid, "enter_description", {"type": "cal_work"})
+            await _reply_max_callback(event, uid, "📅 Опишите работы (объект работ, или «отмена»):", back_only())
             return
 
         # Обычное сообщение: пропуск прикрепления фото (в MAX фото пока не отправляется)

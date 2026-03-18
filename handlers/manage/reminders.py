@@ -74,40 +74,44 @@ async def auto_close_alarm_by_jira_status(bot: Bot, alarm_id: str, alarm: dict, 
         alarm: Данные сбоя
         jira_key: Ключ задачи в Jira
     """
-    user_id = alarm.get("user_id")
-    jira_url = jira_browse_url(jira_key)
-    
-    # Обрабатываем закрытие в SCM канале (если есть тема)
-    await handle_scm_alarm_close(bot, alarm_id, alarm)
+    import asyncio
+    text = f"✅ Сбой устранён\n• Проблема: {alarm.get('issue', 'не указано')}"
 
-    if alarm.get("publish_petlocal", True):
+    async def _task_scm():
+        try:
+            await handle_scm_alarm_close(bot, alarm_id, alarm)
+        except Exception as e:
+            logger.warning(f"[AUTO_CLOSE] SCM для {alarm_id}: {e}", exc_info=True)
+
+    async def _task_petlocal():
+        if not alarm.get("publish_petlocal", True):
+            return
         try:
             closed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
             async with SimpleOneService() as simpleone:
                 html = simpleone.format_alarm_closed_for_petlocal(
-                    alarm_id=alarm_id,
-                    issue=alarm.get("issue", "не указано"),
-                    closed_at=closed_at
+                    alarm_id=alarm_id, issue=alarm.get("issue", "не указано"), closed_at=closed_at
                 )
                 result = await simpleone.create_portal_post(html)
                 if result.get("success"):
                     logger.info(f"[AUTO_CLOSE] Пост о закрытии сбоя {alarm_id} опубликован на Петлокале")
                 else:
-                    logger.warning(f"[AUTO_CLOSE] Не удалось опубликовать пост на Петлокале для {alarm_id}: {result.get('error', '')}")
+                    logger.warning(f"[AUTO_CLOSE] Петлокал для {alarm_id}: {result.get('error', '')}")
         except Exception as e:
-            logger.warning(f"[AUTO_CLOSE] Ошибка при публикации на Петлокале для {alarm_id}: {e}")
+            logger.warning(f"[AUTO_CLOSE] Петлокал для {alarm_id}: {e}", exc_info=True)
 
-    # Отправить сообщение в канал
-    text = (
-        f"✅ Сбой устранён\n"
-        f"• Проблема: {alarm.get('issue', 'не указано')}"
-    )
-    if not await send_to_alarm_channels(bot, text):
-        logger.error(f"[AUTO_CLOSE] Не удалось отправить сообщение в канал для сбоя {alarm_id}")
-    else:
-        logger.info(f"[AUTO_CLOSE] Сообщение об устранении сбоя {alarm_id} отправлено в канал")
-    
-    # Удаляем сбой из активных
+    async def _task_channels():
+        try:
+            ok = await send_to_alarm_channels(bot, text)
+            if ok:
+                logger.info(f"[AUTO_CLOSE] Сообщение об устранении сбоя {alarm_id} отправлено в канал")
+            else:
+                logger.error(f"[AUTO_CLOSE] Не удалось отправить в канал для сбоя {alarm_id}")
+        except Exception as e:
+            logger.warning(f"[AUTO_CLOSE] Каналы для {alarm_id}: {e}", exc_info=True)
+
+    await asyncio.gather(_task_scm(), _task_petlocal(), _task_channels())
+
     del bot_state.active_alarms[alarm_id]
     logger.info(f"[AUTO_CLOSE] Сбой {alarm_id} автоматически закрыт по статусу Jira")
     await bot_state.save_state()
@@ -216,33 +220,14 @@ async def handle_maintenance_reminder_action(call: CallbackQuery, state: FSMCont
     
     if action == "stop":
         logger.info(f"[{user_id}] Работа {work_id} завершена по напоминанию")
-        text = (
-            f"✅ <b>Работа завершена</b>\n"
-            f"• <b>Описание:</b> {work.get('description', 'не указано')}"
-        )
-
-        if work.get("publish_petlocal", True):
-            try:
-                closed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-                async with SimpleOneService() as simpleone:
-                    html = simpleone.format_maintenance_closed_for_petlocal(
-                        work_id=work_id,
-                        description=work.get("description", "не указано"),
-                        closed_at=closed_at
-                    )
-                    result = await simpleone.create_portal_post(html)
-                    if result.get("success"):
-                        logger.info(f"[{user_id}] Пост о завершении работы {work_id} опубликован на Петлокале")
-                    elif result.get("is_token_expired"):
-                        await call.message.answer(
-                            "⚠️ <b>Не удалось опубликовать на Петлокале</b>\n\n🔑 Токен SimpleOne устарел. Обновите токен в настройках бота.",
-                            parse_mode='HTML'
-                        )
-            except Exception as e:
-                logger.warning(f"[{user_id}] Ошибка при публикации на Петлокале: {e}")
-        del bot_state.active_maintenances[work_id]
-        if not await send_to_alarm_channels(call.bot, text):
-            logger.error(f"[{user_id}] Не удалось отправить сообщение о завершении работы {work_id}")
+        from core.actions import stop_maintenance
+        async def _reply_fn(t: str):
+            pass  # UI обновим ниже
+        ok = await stop_maintenance(work_id, call.bot, _reply_fn)
+        if not ok:
+            await call.message.edit_text("❌ Работа не найдена", reply_markup=None)
+            await call.answer()
+            return
         await call.message.edit_text("🚫 Работа завершена по решению автора", reply_markup=None)
         await call.message.answer("Выберите действие:", reply_markup=create_main_keyboard())
         if user_id in bot_state.user_states:
@@ -333,11 +318,17 @@ async def handle_reminder_extension(call: CallbackQuery, state: FSMContext):
             f"• <b>Описание:</b> {work.get('description', 'не указано')}\n"
             f"• <b>Новое время окончания:</b> {new_end.strftime('%d.%m.%Y %H:%M')}"
         )
-        if not await send_to_alarm_channels(call.bot, text):
-            logger.error(f"[{call.from_user.id}] Не удалось отправить сообщение о продлении работы")
-        else:
-            logger.info(f"[{call.from_user.id}] Сообщение о продлении работы отправлено в канал")
-        
+        async def _send():
+            try:
+                ok = await send_to_alarm_channels(call.bot, text)
+                if not ok:
+                    logger.error(f"[{call.from_user.id}] Не удалось отправить сообщение о продлении работы")
+                else:
+                    logger.info(f"[{call.from_user.id}] Сообщение о продлении работы отправлено в канал")
+            except Exception as e:
+                logger.warning(f"[{call.from_user.id}] Каналы при продлении работы: %s", e, exc_info=True)
+        asyncio.create_task(_send())
+
         await call.message.edit_text(f"🕒 Работа {work_id} продлена до {new_end.strftime('%d.%m.%Y %H:%M')}", reply_markup=None)
         await call.message.answer("Выберите действие:", reply_markup=create_main_keyboard())
         await bot_state.save_state()
@@ -393,10 +384,16 @@ async def handle_reminder_extension(call: CallbackQuery, state: FSMContext):
             f"• <b>Проблема:</b> {alarm['issue']}\n"
             f"• <b>Новое время окончания:</b> {new_end.strftime('%d.%m.%Y %H:%M')}"
         )
-        if not await send_to_alarm_channels(call.bot, text):
-            logger.error(f"[{call.from_user.id}] Не удалось отправить сообщение о продлении сбоя")
-        else:
-            logger.info(f"[{call.from_user.id}] Сообщение о продлении отправлено в канал")
+        async def _send():
+            try:
+                ok = await send_to_alarm_channels(call.bot, text)
+                if not ok:
+                    logger.error(f"[{call.from_user.id}] Не удалось отправить сообщение о продлении сбоя")
+                else:
+                    logger.info(f"[{call.from_user.id}] Сообщение о продлении отправлено в канал")
+            except Exception as e:
+                logger.warning(f"[{call.from_user.id}] Каналы при продлении сбоя: %s", e, exc_info=True)
+        asyncio.create_task(_send())
 
         await call.message.edit_text(f"🕒 Сбой {alarm_id} продлён до {new_end.strftime('%d.%m.%Y %H:%M')}", reply_markup=None)
         await call.message.answer("Выберите действие:", reply_markup=create_main_keyboard())

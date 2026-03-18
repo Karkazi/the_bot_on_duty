@@ -1,6 +1,7 @@
 """
 Утилиты для безопасной работы с каналами Telegram и отправки в канал MAX.
 """
+import asyncio
 import logging
 from typing import Optional
 from aiogram import Bot
@@ -18,18 +19,8 @@ async def send_to_alarm_channels(
     **kwargs,
 ) -> bool:
     """
-    Отправляет сообщение в канал уведомлений: Telegram (ALARM_CHANNEL_ID) и при наличии настроек — в канал MAX.
-
-    Сначала отправка в Telegram; при успехе при настроенных MAX_API_URL, MAX_BOT_TOKEN и MAX_ALARM_CHANNEL_ID
-    дублирует сообщение в MAX. Ошибка отправки в MAX не влияет на возвращаемое значение.
-
-    Args:
-        bot: Экземпляр бота (для Telegram).
-        text: Текст сообщения (в Telegram при фото используется как caption).
-        parse_mode: Режим парсинга для Telegram (по умолчанию HTML).
-        photo_file_id: Опционально — file_id фото в Telegram; при заданном отправляется send_photo с caption=text.
-        photo_url: Опционально — URL фото; используется если photo_file_id не задан.
-        **kwargs: Дополнительные аргументы для send_message/send_photo в Telegram.
+    Отправляет сообщение в каналы уведомлений: Telegram и MAX — одновременно через asyncio.gather.
+    Ошибка в одном канале не блокирует другой.
 
     Returns:
         True если сообщение успешно отправлено в Telegram, False иначе.
@@ -41,19 +32,21 @@ async def send_to_alarm_channels(
         return False
 
     photo_ref = photo_file_id or (photo_url.strip() if photo_url else None)
-    if photo_ref:
-        ok = await safe_send_photo_to_channel(
-            bot, channel_id, photo_ref, caption=text, parse_mode=parse_mode, **kwargs
-        )
-    else:
-        ok = await safe_send_to_channel(bot, channel_id, text, parse_mode=parse_mode, **kwargs)
-    if not ok:
-        return False
 
-    # Дублирование в канал MAX при наличии настроек
-    max_cfg = CONFIG.get("MAX", {})
-    max_channel_id = max_cfg.get("ALARM_CHANNEL_ID")
-    if max_channel_id:
+    async def _send_tg() -> bool:
+        if photo_ref:
+            return await safe_send_photo_to_channel(
+                bot, channel_id, photo_ref, caption=text, parse_mode=parse_mode, **kwargs
+            )
+        return await safe_send_to_channel(bot, channel_id, text, parse_mode=parse_mode, **kwargs)
+
+    async def _send_max() -> Optional[bool]:
+        max_cfg = CONFIG.get("MAX", {})
+        max_channel_id = max_cfg.get("ALARM_CHANNEL_ID")
+        if not max_channel_id:
+            if max_cfg.get("API_URL") or max_cfg.get("BOT_TOKEN"):
+                logger.debug("MAX: API_URL/BOT_TOKEN заданы, но MAX_ALARM_CHANNEL_ID не указан — пропущено")
+            return None
         try:
             from services.max_service import MaxService
             max_svc = MaxService()
@@ -62,20 +55,18 @@ async def send_to_alarm_channels(
                     "MAX: задан MAX_ALARM_CHANNEL_ID, но MAX не настроен полностью. "
                     "Укажите MAX_API_URL и MAX_BOT_TOKEN в .env"
                 )
-            else:
-                logger.info("Отправка дубликата сообщения в канал MAX (channel_id=%s)", max_channel_id)
-                ok_max = await max_svc.send_message(max_channel_id, text, strip_html=True)
-                if not ok_max:
-                    logger.warning("Отправка в канал MAX завершилась с ошибкой (см. логи выше)")
+                return None
+            logger.info("Отправка дубликата сообщения в канал MAX (channel_id=%s)", max_channel_id)
+            ok_max = await max_svc.send_message(max_channel_id, text, strip_html=True)
+            if not ok_max:
+                logger.warning("Отправка в канал MAX завершилась с ошибкой (см. логи выше)")
+            return ok_max
         except Exception as e:
             logger.warning("Не удалось отправить сообщение в канал MAX: %s", e, exc_info=True)
-    else:
-        # Все три параметра MAX должны быть заданы для дублирования
-        if max_cfg.get("API_URL") or max_cfg.get("BOT_TOKEN"):
-            logger.debug(
-                "MAX: API_URL или BOT_TOKEN заданы, но MAX_ALARM_CHANNEL_ID не указан — дублирование в MAX пропущено"
-            )
-    return True
+            return False
+
+    ok_tg, _ = await asyncio.gather(_send_tg(), _send_max())
+    return ok_tg
 
 
 async def safe_send_photo_to_channel(

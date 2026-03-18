@@ -19,11 +19,9 @@ from keyboards import (
 )
 from utils.helpers import is_admin
 from utils.callback_validator import validate_callback
-from utils.channel_helpers import send_to_alarm_channels
 from domain.states import StopStates
 from bot_state import bot_state
 from config import CONFIG
-from services.simpleone_service import SimpleOneService
 
 logger = logging.getLogger(__name__)
 router = Router()
@@ -288,10 +286,10 @@ async def handle_action_callback(call: CallbackQuery, state: FSMContext):
 
     if action == "action_stop":
         logger.info(f"[{call.from_user.id}] Начата остановка {data_type}: {item_id}")
+        async def reply_fn(t: str):
+            await call.message.answer(t)
         if data_type == "alarm":
             from core.actions import stop_alarm
-            async def reply_fn(t: str):
-                await call.message.answer(t)
             success = await stop_alarm(item_id, call.bot, reply_fn)
             if not success:
                 await call.answer("❌ Не удалось остановить сбой", show_alert=True)
@@ -299,39 +297,11 @@ async def handle_action_callback(call: CallbackQuery, state: FSMContext):
             logger.info(f"[{call.from_user.id}] Сбой {item_id} удалён из состояния")
 
         elif data_type == "maintenance":
-            maint_info = bot_state.active_maintenances[item_id]
-
-            if maint_info.get("publish_petlocal", True):
-                try:
-                    closed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
-                    async with SimpleOneService() as simpleone:
-                        html = simpleone.format_maintenance_closed_for_petlocal(
-                            work_id=item_id,
-                            description=maint_info.get("description", "не указано"),
-                            closed_at=closed_at
-                        )
-                        result = await simpleone.create_portal_post(html)
-                        if result.get("success"):
-                            logger.info(f"[{call.from_user.id}] Пост о завершении работы {item_id} опубликован на Петлокале")
-                        else:
-                            error_msg = result.get("error", "Неизвестная ошибка")
-                            logger.warning(f"[{call.from_user.id}] Не удалось опубликовать пост на Петлокале: {error_msg}")
-                            if result.get("is_token_expired"):
-                                await call.message.answer(
-                                    "⚠️ <b>Не удалось опубликовать на Петлокале</b>\n\n"
-                                    "🔑 <b>Токен SimpleOne устарел</b>\nТокены действительны 2 часа. Обновите токен в настройках бота.",
-                                    parse_mode='HTML'
-                                )
-                except Exception as e:
-                    logger.warning(f"[{call.from_user.id}] Ошибка при публикации на Петлокале: {e}", exc_info=True)
-
-            del bot_state.active_maintenances[item_id]
-            text = (
-                f"✅ <b>Работа завершена</b>\n"
-                f"• <b>Описание:</b> {maint_info['description']}"
-            )
-            if not await send_to_alarm_channels(call.bot, text):
-                logger.error(f"[{call.from_user.id}] Не удалось отправить сообщение о завершении работы {item_id}")
+            from core.actions import stop_maintenance
+            success = await stop_maintenance(item_id, call.bot, reply_fn)
+            if not success:
+                await call.answer("❌ Не удалось остановить работу", show_alert=True)
+                return
             logger.info(f"[{call.from_user.id}] Работа {item_id} удалена из состояния")
 
         await call.message.edit_text(f"{('🚨 Сбой' if data_type == 'alarm' else '🔧 Работа')} {item_id} остановлен(а)")

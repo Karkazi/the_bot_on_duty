@@ -2,6 +2,7 @@
 Обработчики для продления событий (аварий и работ).
 Содержит логику выбора времени продления и обновления времени окончания.
 """
+import asyncio
 import logging
 from datetime import datetime, timedelta
 from datetime import datetime as dt
@@ -107,10 +108,16 @@ async def handle_alarm_extension_callback(call: CallbackQuery, state: FSMContext
         f"• <b>Проблема:</b> {alarm['issue']}\n"
         f"• <b>Новое время окончания:</b> {new_end.strftime('%d.%m.%Y %H:%M')}"
     )
-    if not await send_to_alarm_channels(call.bot, text):
-        logger.error(f"[{call.from_user.id}] Не удалось отправить сообщение о продлении сбоя")
-    else:
-        logger.info(f"[{call.from_user.id}] Сообщение о продлении отправлено в канал")
+    async def _send():
+        try:
+            ok = await send_to_alarm_channels(call.bot, text)
+            if not ok:
+                logger.error(f"[{call.from_user.id}] Не удалось отправить сообщение о продлении сбоя")
+            else:
+                logger.info(f"[{call.from_user.id}] Сообщение о продлении отправлено в канал")
+        except Exception as e:
+            logger.warning(f"[{call.from_user.id}] Каналы при продлении сбоя: %s", e, exc_info=True)
+    asyncio.create_task(_send())
 
     await call.message.edit_text(f"🕒 Сбой {item_id} продлён до {new_end.strftime('%d.%m.%Y %H:%M')}", reply_markup=None)
     await call.message.answer("Выберите действие:", reply_markup=create_main_keyboard())
@@ -216,17 +223,22 @@ async def handle_alarm_duration_manual(message: Message, state: FSMContext):
     
     logger.info(f"[{user_id}] Сбой {item_id} продлён на {delta} (вручную), новое время: {new_end.isoformat()}")
     
-    # Отправляем сообщение в канал
     text = (
         f"🔄 <b>Сбой продлён</b>\n"
         f"• <b>Проблема:</b> {alarm['issue']}\n"
         f"• <b>Новое время окончания:</b> {new_end.strftime('%d.%m.%Y %H:%M')}"
     )
-    if not await send_to_alarm_channels(message.bot, text):
-        logger.error(f"[{user_id}] Не удалось отправить сообщение о продлении сбоя")
-    else:
-        logger.info(f"[{user_id}] Сообщение о продлении отправлено в канал")
-    
+    async def _send():
+        try:
+            ok = await send_to_alarm_channels(message.bot, text)
+            if not ok:
+                logger.error(f"[{user_id}] Не удалось отправить сообщение о продлении сбоя")
+            else:
+                logger.info(f"[{user_id}] Сообщение о продлении отправлено в канал")
+        except Exception as e:
+            logger.warning(f"[{user_id}] Каналы при продлении сбоя: %s", e, exc_info=True)
+    asyncio.create_task(_send())
+
     await message.answer(
         f"✅ Сбой {item_id} продлён до {new_end.strftime('%d.%m.%Y %H:%M')}",
         reply_markup=create_main_keyboard()
@@ -273,10 +285,16 @@ async def handle_maintenance_new_end(message: Message, state: FSMContext):
             f"• <b>Описание:</b> {maint['description']}\n"
             f"• <b>Новое время окончания:</b> {new_time.strftime(DATETIME_FORMAT)}"
         )
-        if not await send_to_alarm_channels(message.bot, text):
-            logger.error(f"[{message.from_user.id}] Не удалось отправить сообщение о продлении работы")
-        else:
-            logger.info(f"[{message.from_user.id}] Сообщение о продлении работы отправлено в канал")
+        async def _send():
+            try:
+                ok = await send_to_alarm_channels(message.bot, text)
+                if not ok:
+                    logger.error(f"[{message.from_user.id}] Не удалось отправить сообщение о продлении работы")
+                else:
+                    logger.info(f"[{message.from_user.id}] Сообщение о продлении работы отправлено в канал")
+            except Exception as e:
+                logger.warning(f"[{message.from_user.id}] Каналы при продлении работы: %s", e, exc_info=True)
+        asyncio.create_task(_send())
 
         await message.answer(f"🕒 Работа {item_id} продлена до {new_time.strftime(DATETIME_FORMAT)}")
         await bot_state.save_state()

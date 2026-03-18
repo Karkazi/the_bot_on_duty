@@ -109,6 +109,57 @@ class MaxService:
             logger.exception("Ошибка при отправке сообщения в MAX: %s", e)
             return False
 
+    async def send_message_to_user(
+        self,
+        user_id: int,
+        text: str,
+        attachment_tokens: Optional[List[Dict[str, Any]]] = None,
+        strip_html: bool = True,
+    ) -> bool:
+        """
+        Отправляет личное сообщение пользователю MAX (POST /messages?user_id=...).
+
+        Args:
+            user_id: user_id в MAX.
+            text: Текст сообщения.
+            attachment_tokens: Вложения (например, кнопки) в формате API MAX.
+            strip_html: Удалять HTML из текста.
+
+        Returns:
+            True при успехе.
+        """
+        if not self._enabled:
+            logger.debug("MAX не настроен, отправка пропущена")
+            return False
+        body_text = _strip_html(text) if strip_html else text
+        url = f"{self.api_url}/messages"
+        params = {"user_id": user_id}
+        payload = {"text": body_text or ""}
+        if attachment_tokens:
+            payload["attachments"] = attachment_tokens
+        try:
+            async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    url,
+                    params=params,
+                    json=payload,
+                    headers=self._headers,
+                    timeout=aiohttp.ClientTimeout(total=10),
+                ) as response:
+                    if response.status == 200:
+                        logger.info("Сообщение отправлено в MAX пользователю user_id=%s", user_id)
+                        return True
+                    err_body = await response.text()
+                    logger.warning(
+                        "MAX API send_message_to_user: status=%s, body=%s",
+                        response.status,
+                        err_body[:300],
+                    )
+                    return False
+        except Exception as e:
+            logger.exception("Ошибка send_message_to_user MAX: %s", e)
+            return False
+
     async def send_message_with_attachments(
         self,
         chat_id: str,

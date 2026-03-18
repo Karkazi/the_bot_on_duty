@@ -48,7 +48,9 @@ class BotState:
         self.extension_queue: Dict[int, deque] = {}  # {user_id: deque(alarm_ids)}
         self.user_processing: set = set()
         self.active_maintenances: Dict[str, Dict] = {}
-        
+        # Работы из Confluence: work_id -> {status, description, start_time_str, end_time_str, ...} для детекции новых и кнопок Информировать/Пропустить
+        self.known_maintenances_from_confluence: Dict[str, Dict] = {}
+
         # Очередь для асинхронного сохранения
         self._use_queue = use_queue
         self._save_queue = None
@@ -108,7 +110,8 @@ class BotState:
         state = {
             'active_alarms': {},
             'active_maintenances': {},
-            'user_states': {}
+            'user_states': {},
+            'known_maintenances_from_confluence': {},
         }
 
         async with self._lock:  # Используем async with для асинхронной блокировки
@@ -157,6 +160,16 @@ class BotState:
                     'petlocal_post_id': work.get('petlocal_post_id'),
                     'petlocal_object_id': work.get('petlocal_object_id'),
                     'publish_petlocal': work.get('publish_petlocal', False),
+                }
+
+            # --- Сохранение известных работ из Confluence ---
+            for work_id, work in self.known_maintenances_from_confluence.items():
+                start_time = work.get("start_time")
+                end_time = work.get("end_time")
+                state['known_maintenances_from_confluence'][work_id] = {
+                    **{k: v for k, v in work.items() if k not in ("start_time", "end_time")},
+                    "start_time": start_time.isoformat() if isinstance(start_time, datetime) else start_time,
+                    "end_time": end_time.isoformat() if isinstance(end_time, datetime) else end_time,
                 }
 
             # --- Сохранение пользовательских состояний ---
@@ -226,9 +239,10 @@ class BotState:
             data = {
                 'active_alarms': {},
                 'active_maintenances': {},
-                'user_states': {}
+                'user_states': {},
+                'known_maintenances_from_confluence': {},
             }
-            
+
         except json.JSONDecodeError as je:
             # BUG #2 FIX: Обработка поврежденного JSON файла
             logger.warning(f"⚠️ Файл состояния поврежден: {je}")
@@ -248,25 +262,28 @@ class BotState:
             data = {
                 'active_alarms': {},
                 'active_maintenances': {},
-                'user_states': {}
+                'user_states': {},
+                'known_maintenances_from_confluence': {},
             }
             logger.info("🆕 Используется новое пустое состояние")
-            
+
         except Exception as e:
             # BUG #2 FIX: Обработка всех остальных ошибок
             logger.critical(f"❌ Критическая ошибка при загрузке состояния: {str(e)}", exc_info=True)
             data = {
                 'active_alarms': {},
                 'active_maintenances': {},
-                'user_states': {}
+                'user_states': {},
+                'known_maintenances_from_confluence': {},
             }
-        
+
         # Загружаем данные из data (может быть пустым при ошибках)
         try:
             async with self._lock:
                 self.active_alarms.clear()
                 self.active_maintenances.clear()
                 self.user_states.clear()
+                self.known_maintenances_from_confluence.clear()
 
             # --- Загрузка аварий ---
             for alarm_id, alarm_data in data.get("active_alarms", {}).items():
@@ -372,6 +389,27 @@ class BotState:
                     logger.warning(f"⚠️ Ошибка при обработке состояния пользователя {user_id_str}: {ve}")
                 except Exception as e:
                     logger.error(f"❌ Неожиданная ошибка: {e}", exc_info=True)
+
+            # --- Загрузка известных работ из Confluence ---
+            for work_id, work_data in data.get("known_maintenances_from_confluence", {}).items():
+                try:
+                    start_time = safe_parse_time(work_data.get("start_time"))
+                    end_time = safe_parse_time(work_data.get("end_time"))
+                    if start_time is None or end_time is None:
+                        continue
+                    self.known_maintenances_from_confluence[work_id] = {
+                        "status": work_data.get("status", "pending_decision"),
+                        "description": work_data.get("description", ""),
+                        "start_time_str": work_data.get("start_time_str", ""),
+                        "end_time_str": work_data.get("end_time_str", ""),
+                        "unavailable_services": work_data.get("unavailable_services", "не указано"),
+                        "notify": work_data.get("notify", ""),
+                        "owner": work_data.get("owner", ""),
+                        "start_time": start_time,
+                        "end_time": end_time,
+                    }
+                except Exception as e:
+                    logger.debug("Пропущена запись known_confluence %s: %s", work_id, e)
 
         except Exception as e:
             logger.error(f"❌ Ошибка при обработке данных состояния: {e}", exc_info=True)

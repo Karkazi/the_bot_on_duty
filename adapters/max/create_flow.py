@@ -118,6 +118,12 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
         await reply_fn("Введите 1, 2 или 3.")
         return True
 
+    if step == "select_type" and text.strip() == "4":
+        update_session_data(user_id, type="cal_work")
+        set_session(user_id, "enter_description")
+        await reply_fn("📅 Опишите работы (объект работ, или «отмена»):")
+        return True
+
     msg_type = data.get("type")
 
     # --- Сбой ---
@@ -318,6 +324,74 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
 
         await reply_fn("📷 Пришлите картинку сообщением или нажмите «Пропустить».", "regular_photo_keyboard")
         return True
+
+    # --- Добавить в календарь работ (cal_work) ---
+    if step == "enter_description" and msg_type == "cal_work":
+        ok, err = validate_description(text)
+        if not ok:
+            await reply_fn(err or "Неверное описание.")
+            return True
+        update_session_data(user_id, description=sanitize_html(text))
+        set_session(user_id, "enter_start_time")
+        await reply_fn(
+            "⏰ Время начала. Нажмите «Спиннеры» или напишите дату и время:\n"
+            "• Точный формат: 02.02.2026 14:00\n"
+            "• Или: через 30 мин, через 1 час, сегодня 14:00, завтра 10:00, 14:00",
+            "maintenance_time_method_keyboard",
+        )
+        return True
+
+    if step == "enter_start_time" and msg_type == "cal_work":
+        start_time = parse_flexible_datetime(text, base_time=None, format_str=DATETIME_FORMAT)
+        if start_time is None:
+            is_valid, err = validate_datetime_format(text, DATETIME_FORMAT)
+            if not is_valid:
+                await reply_fn(err or "Неверный формат. Примеры: 02.02.2026 14:00, через 1 час, завтра 10:00")
+            return True
+        update_session_data(user_id, start_time=start_time.isoformat())
+        set_session(user_id, "enter_end_time")
+        await reply_fn(
+            "⏰ Время окончания. Напишите дату и время или, например:\n"
+            "• через 1 час (от начала), 02.02.2026 18:00, завтра 12:00"
+        )
+        return True
+
+    if step == "enter_end_time" and msg_type == "cal_work":
+        session_data = get_session(user_id)
+        data = session_data.get("data", {})
+        start_str = data.get("start_time")
+        if not start_str:
+            await reply_fn("Ошибка: нет времени начала. Начните заново.")
+            clear_session(user_id)
+            return True
+        start_time = dt.fromisoformat(start_str)
+        end_time = parse_flexible_datetime(text, base_time=start_time, format_str=DATETIME_FORMAT)
+        if end_time is None:
+            is_valid, err = validate_datetime_format(text, DATETIME_FORMAT)
+            if not is_valid:
+                await reply_fn(err or "Неверный формат. Пример: 02.02.2026 18:00 или через 1 час")
+            return True
+        if end_time <= start_time:
+            await reply_fn("Время окончания должно быть позже начала.")
+            return True
+        update_session_data(user_id, end_time=end_time.isoformat())
+        set_session(user_id, "enter_unavailable_services")
+        await reply_fn("🔌 Что будет недоступно во время работ? (кратко)")
+        return True
+
+    if step == "enter_unavailable_services" and msg_type == "cal_work":
+        update_session_data(user_id, unavailable_services=text.strip() or "не указано")
+        set_session(user_id, "enter_cal_tech_description")
+        await reply_fn("📋 Краткое описание для технических специалистов:")
+        return True
+
+    if step == "enter_cal_tech_description" and msg_type == "cal_work":
+        update_session_data(user_id, cal_tech_description=text.strip() or "не указано")
+        set_session(user_id, "select_cal_notify")
+        await reply_fn("📢 Выберите каналы оповещения:", "cal_notify_keyboard")
+        return True
+
+    # select_cal_notify обрабатывается только через callback-кнопки в handlers.py
 
     # --- Петлокал (общий) ---
     if step == "select_petlocal":

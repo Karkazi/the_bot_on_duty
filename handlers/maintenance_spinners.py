@@ -1,7 +1,7 @@
 """
 Обработчики спиннеров для выбора времени регламентных работ
 """
-
+import asyncio
 import logging
 from datetime import datetime as dt, timedelta
 from aiogram import Router, F
@@ -724,16 +724,21 @@ async def finalize_extend_spinner_selection(
         
         logger.info(f"[{user_id}] Время окончания работы {item_id} изменено через спиннеры: {new_end_time}")
         
-        # Отправляем сообщение в канал
-        text = (
+        channel_text = (
             f"🔄 <b>Работа продлена</b>\n"
             f"• <b>Описание:</b> {maint['description']}\n"
             f"• <b>Новое время окончания:</b> {new_end_time.strftime(DATETIME_FORMAT)}"
         )
-        if not await send_to_alarm_channels(message.bot, text):
-            logger.error(f"[{user_id}] Не удалось отправить сообщение о продлении работы")
-        else:
-            logger.info(f"[{user_id}] Сообщение о продлении работы отправлено в канал")
+        async def _send():
+            try:
+                ok = await send_to_alarm_channels(message.bot, channel_text)
+                if not ok:
+                    logger.error(f"[{user_id}] Не удалось отправить сообщение о продлении работы")
+                else:
+                    logger.info(f"[{user_id}] Сообщение о продлении работы отправлено в канал")
+            except Exception as e:
+                logger.warning(f"[{user_id}] Каналы при продлении: %s", e, exc_info=True)
+        asyncio.create_task(_send())
         
         # Сохраняем состояние
         await bot_state.save_state()

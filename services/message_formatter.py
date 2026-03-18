@@ -11,6 +11,53 @@ from config import ktalk_emergency_url
 
 class MessageFormatter:
     """Сервис для форматирования сообщений"""
+
+    @staticmethod
+    def _link(url: Optional[str], label: str) -> str:
+        """HTML-ссылка. Если url пустой — возвращает label как текст."""
+        if not url:
+            return label
+        safe_url = (url or "").replace("&", "&amp;").replace('"', "&quot;")
+        return f'<a href="{safe_url}">{label}</a>'
+
+    @staticmethod
+    def format_alarm_unified_html(
+        *,
+        alarm_id: str,
+        description: str,
+        service: str,
+        jira_url: Optional[str] = None,
+        scm_topic_url: Optional[str] = None,
+        max_chat_url: Optional[str] = None,
+        ktalk_url: Optional[str] = None,
+    ) -> str:
+        """
+        Единый формат уведомления о сбое для Telegram и MAX (HTML).
+        Важно: alarm_id, Telegram, MAX должны оставаться кликабельными ссылками.
+        """
+        lines = [
+            "🚨 Технический сбой",
+            f"📋 {description}",
+            f"📋 Сервис: {service}",
+        ]
+
+        if jira_url:
+            lines.append(f"🔗 Jira: {MessageFormatter._link(jira_url, alarm_id)}")
+        else:
+            lines.append(f"🔗 Jira: {alarm_id}")
+
+        lines.append(
+            "💬 Обсуждение: тема в канале SCM (" + MessageFormatter._link(scm_topic_url, "Telegram") + ")."
+        )
+        lines.append(
+            "💬 Чат сбоя: " + MessageFormatter._link(max_chat_url, "MAX") + "."
+        )
+
+        if ktalk_url:
+            # Делаем ссылкой сам URL — и в TG, и в MAX будет кликабельно.
+            lines.append("💬 Ссылка в Ктолк: " + MessageFormatter._link(ktalk_url, ktalk_url))
+
+        return "\n".join(lines)
     
     @staticmethod
     def format_alarm_message(

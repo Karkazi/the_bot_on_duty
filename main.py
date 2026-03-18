@@ -28,6 +28,7 @@ from handlers import (
 from handlers.current_events import router as current_events_router
 from handlers.maintenance_spinners import router as maintenance_spinners_router
 from handlers.manage.reminders import check_reminders
+from handlers.manage.confluence_calendar import check_confluence_maintenances
 
 # Интервал перевыпуска токена SimpleOne (мин). Токен живёт ~120 мин — обновляем заранее.
 SIMPLEONE_TOKEN_REFRESH_MINUTES = 100
@@ -42,7 +43,6 @@ def setup_logging():
     log_level_name = os.getenv("LOG_LEVEL", "INFO").upper()
     log_level = getattr(logging, log_level_name, logging.INFO)
     log_format = "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
-
     # Логирование в файл
     file_handler = logging.FileHandler("bot.log", encoding="utf-8")
     file_handler.setLevel(log_level)
@@ -170,9 +170,13 @@ async def main():
     # Запуск бота
     max_task = None
     refresh_task = None
+    confluence_task = None
     try:
         logger.info("🤖 Бот начал работу")
         asyncio.create_task(check_reminders(bot))
+        if CONFIG.get("MAX", {}).get("CALENDAR_ADMIN_IDS") and CONFIG.get("CONFLUENCE", {}).get("LOGIN_URL"):
+            confluence_task = asyncio.create_task(check_confluence_maintenances(bot))
+            logger.info("Запущена проверка календаря Confluence каждые 10 с, уведомления в MAX_CALENDAR_ADMIN_IDS")
         if CONFIG.get("SIMPLEONE", {}).get("USERNAME") and CONFIG.get("SIMPLEONE", {}).get("PASSWORD"):
             refresh_task = asyncio.create_task(refresh_simpleone_token_task())
             logger.info("✅ Запущено фоновое обновление токена SimpleOne каждые %s мин", SIMPLEONE_TOKEN_REFRESH_MINUTES)
@@ -205,6 +209,12 @@ async def main():
             refresh_task.cancel()
             try:
                 await refresh_task
+            except asyncio.CancelledError:
+                pass
+        if confluence_task is not None and not confluence_task.done():
+            confluence_task.cancel()
+            try:
+                await confluence_task
             except asyncio.CancelledError:
                 pass
         # Останавливаем очередь и сохраняем последнее состояние

@@ -2,6 +2,7 @@
 Обработчики календаря для выбора даты и времени.
 Содержит логику выбора месяца, дня, часа и минуты для аварий и работ.
 """
+import asyncio
 import logging
 from datetime import datetime as dt
 from aiogram import Router, F
@@ -210,16 +211,21 @@ async def select_minute(call: CallbackQuery, state: FSMContext):
                 
                 logger.info(f"[{user_id}] Время окончания работы {item_id} изменено через календарь: {selected_time.isoformat()}")
                 
-                # Отправляем сообщение в канал
                 text = (
                     f"🔄 <b>Работа продлена</b>\n"
                     f"• <b>Описание:</b> {maint['description']}\n"
                     f"• <b>Новое время окончания:</b> {selected_time.strftime(DATETIME_FORMAT)}"
                 )
-                if not await send_to_alarm_channels(call.bot, text):
-                    logger.error(f"[{user_id}] Не удалось отправить сообщение о продлении работы")
-                else:
-                    logger.info(f"[{user_id}] Сообщение о продлении работы отправлено в канал")
+                async def _send():
+                    try:
+                        ok = await send_to_alarm_channels(call.bot, text)
+                        if not ok:
+                            logger.error(f"[{user_id}] Не удалось отправить сообщение о продлении работы")
+                        else:
+                            logger.info(f"[{user_id}] Сообщение о продлении работы отправлено в канал")
+                    except Exception as e:
+                        logger.warning(f"[{user_id}] Каналы при продлении: %s", e, exc_info=True)
+                asyncio.create_task(_send())
                 
                 # Сохраняем состояние
                 await bot_state.save_state()

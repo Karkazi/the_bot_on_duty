@@ -38,10 +38,20 @@ def main_menu() -> Optional[List[Any]]:
 
 
 def message_type_menu() -> Optional[List[Any]]:
-    """Выбор типа сообщения: Сбой, Работа, Обычное, Назад."""
+    """Выбор типа сообщения: Сбой, Работа, Обычное, Добавить в календарь, Назад."""
     return _pack([
         [_btn("🚨 Сбой", "msg_type_alarm"), _btn("🔧 Работа", "msg_type_maintenance")],
         [_btn("📝 Обычное сообщение", "msg_type_regular")],
+        [_btn("📅 Добавить в календарь работ", "msg_type_cal_work")],
+        [_btn("◀️ Назад в меню", "cmd_back")],
+    ])
+
+
+def cal_notify_keyboard() -> Optional[List[Any]]:
+    """Выбор каналов оповещения для записи в календарь работ."""
+    return _pack([
+        [_btn("🚫 Не оповещаем", "cal_notify_none"), _btn("🏢 Петлокал", "cal_notify_petlocal")],
+        [_btn("💬 Мессенджеры", "cal_notify_messengers"), _btn("💬🏢 Мессенджеры+Петлокал", "cal_notify_both")],
         [_btn("◀️ Назад в меню", "cmd_back")],
     ])
 
@@ -183,3 +193,27 @@ def create_time_spinner_keyboard_max(
         [_btn("✅ Дальше", "spinner_next"), _btn("⏪ Назад", "spinner_prev")],
         [_btn("❌ Отмена", "spinner_cancel")],
     ])
+
+
+def confluence_notify_keyboard(work_id: str) -> Optional[List[Any]]:
+    """Клавиатура для запроса по новой работе из Confluence: Информировать / Не информировать."""
+    return _pack([
+        [_btn("✅ Информировать", f"conf_notify_{work_id}"), _btn("❌ Не информировать", f"conf_skip_{work_id}")],
+    ])
+
+
+def confluence_notify_attachment_tokens(work_id: str) -> list:
+    """Вложения кнопок для REST API (send_message_to_user): формат POST /messages — inline_keyboard, type callback."""
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "✅ Информировать", "payload": f"conf_notify_{work_id}"},
+                        {"type": "callback", "text": "❌ Не информировать", "payload": f"conf_skip_{work_id}"},
+                    ],
+                ],
+            },
+        },
+    ]

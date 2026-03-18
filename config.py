@@ -103,6 +103,20 @@ def _parse_max_admin_ids() -> list:
     return ids
 
 
+def _parse_max_calendar_admin_ids() -> list:
+    """Парсит MAX_CALENDAR_ADMIN_IDS из .env (список user_id в MAX для запросов по новым регламентным работам из Confluence)."""
+    s = os.getenv("MAX_CALENDAR_ADMIN_IDS", "")
+    ids = []
+    for part in (s or "").split(","):
+        part = part.strip()
+        if part:
+            try:
+                ids.append(int(part))
+            except ValueError:
+                logger.warning("Некорректный MAX_CALENDAR_ADMIN_ID пропущен: %r", part)
+    return ids
+
+
 def load_config() -> Dict[str, Any]:
     """
     Загружает конфигурацию из переменных окружения (.env файл).
@@ -142,8 +156,10 @@ def load_config() -> Dict[str, Any]:
         "CONFLUENCE": {
             "LOGIN_URL": confluence_login_url.strip() if confluence_login_url else "",
             "TARGET_URL": confluence_target_url.strip() if confluence_target_url else "",
-            "USERNAME": os.getenv("CONFLUENCE_USERNAME", ""),
-            "PASSWORD": os.getenv("CONFLUENCE_PASSWORD", "")
+            "WORKS_PAGE_ID": (os.getenv("CONFLUENCE_WORKS_PAGE_ID", "") or "").strip() or None,
+            "USERNAME": (os.getenv("CONFLUENCE_USERNAME", "") or "").strip(),
+            "PASSWORD": (os.getenv("CONFLUENCE_PASSWORD", "") or "").strip(),
+            "TOKEN": (os.getenv("CONFLUENCE_TOKEN", "") or "").strip(),
         },
         "TELEGRAM": {
             "TOKEN": os.getenv("TELEGRAM_TOKEN", ""),
@@ -201,6 +217,8 @@ def load_config() -> Dict[str, Any]:
                 os.getenv("MAX_MANAGEMENT_ENABLED", "").strip().lower() not in ("0", "false", "no")
                 and bool(os.getenv("MAX_BOT_TOKEN", ""))
             ),
+            # user_id в MAX, которым отправляются запросы на оповещение по новым работам из Confluence
+            "CALENDAR_ADMIN_IDS": _parse_max_calendar_admin_ids(),
         },
         "LINKS": {
             # Шаблон ссылки на задачу Jira, формат: https://jira.example.com/browse/{issue_key}
@@ -291,8 +309,13 @@ def telegram_topic_url(channel_id: str, topic_id: int) -> str:
     if cid.startswith("-100"):
         cid = cid[4:]
     tmpl = (CONFIG.get("LINKS", {}).get("TELEGRAM_TOPIC_URL_TEMPLATE") or "").strip()
+    # Иногда в .env по ошибке пишут "VAR==https://..." и значение становится "=https://..."
+    while tmpl.startswith("="):
+        tmpl = tmpl[1:].lstrip()
     if not tmpl:
-        return ""
+        tmpl = "https://t.me/c/{channel_id}/{topic_id}"
+    if "{channel_id}" not in tmpl or "{topic_id}" not in tmpl:
+        tmpl = "https://t.me/c/{channel_id}/{topic_id}"
     try:
         return tmpl.format(channel_id=cid, topic_id=topic_id)
     except Exception:

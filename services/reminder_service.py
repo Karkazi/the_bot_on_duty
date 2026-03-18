@@ -276,11 +276,14 @@ class ReminderService:
                 alarm_service = AlarmService(self.bot_state)
                 closed_alarm = alarm_service.close_alarm(alarm_id)
 
-                if closed_alarm.get("publish_petlocal", True):
-                    try:
-                        from datetime import datetime as _dt
-                        from services.simpleone_service import SimpleOneService
+                import asyncio
+                from datetime import datetime as _dt
 
+                async def _task_petlocal():
+                    if not closed_alarm.get("publish_petlocal", True):
+                        return
+                    try:
+                        from services.simpleone_service import SimpleOneService
                         closed_at = _dt.now().strftime("%d.%m.%Y %H:%M")
                         async with SimpleOneService() as simpleone:
                             html = simpleone.format_alarm_closed_for_petlocal(
@@ -296,16 +299,24 @@ class ReminderService:
                     except Exception as e:
                         logger.warning(f"Ошибка при публикации на Петлокале для {alarm_id}: {e}")
 
-                # Обрабатываем закрытие в SCM (импорт внутри для избежания циклических зависимостей)
-                try:
-                    from handlers.manage.scm import handle_scm_alarm_close
-                    await handle_scm_alarm_close(bot, alarm_id, closed_alarm)
-                except ImportError:
-                    logger.warning("Не удалось импортировать handle_scm_alarm_close")
+                async def _task_scm():
+                    try:
+                        from handlers.manage.scm import handle_scm_alarm_close
+                        await handle_scm_alarm_close(bot, alarm_id, closed_alarm)
+                    except ImportError:
+                        logger.warning("Не удалось импортировать handle_scm_alarm_close")
+                    except Exception as e:
+                        logger.warning(f"SCM при закрытии {alarm_id}: {e}", exc_info=True)
 
-                # Отправляем сообщение в канал (Telegram и при наличии настроек — MAX)
-                text = f"✅ Сбой устранён\n• Проблема: {closed_alarm.get('issue', 'не указано')}"
-                await send_to_alarm_channels(bot, text, parse_mode=None)
+                async def _task_channels():
+                    try:
+                        from utils.channel_helpers import send_to_alarm_channels
+                        text = f"✅ Сбой устранён\n• Проблема: {closed_alarm.get('issue', 'не указано')}"
+                        await send_to_alarm_channels(bot, text, parse_mode=None)
+                    except Exception as e:
+                        logger.warning(f"Каналы при закрытии {alarm_id}: {e}", exc_info=True)
+
+                await asyncio.gather(_task_petlocal(), _task_scm(), _task_channels())
                 
                 # Уведомляем пользователя
                 user_id = closed_alarm.get("user_id")
