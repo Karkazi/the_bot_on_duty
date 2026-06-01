@@ -107,6 +107,8 @@ async def download_attachment_max(url: str, att_type: str = "", filename: str = 
                         name = filename or f"attachment_{url.split('/')[-1].split('?')[0][:20] or 'file'}{default_ext}"
                     logger.debug("MAX: вложение скачано, размер %s", len(content))
                     return (content, name)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX: ошибка скачивания вложения (попытка %s): %s", attempt + 1, e)
             if attempt < MAX_ATTACHMENTS_DOWNLOAD_RETRIES - 1:
@@ -143,6 +145,8 @@ async def upload_image_max(image_path: str) -> Optional[str]:
         return None
     try:
         raw = path.read_bytes()
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning("MAX: не удалось прочитать файл %s: %s", image_path, e)
         return None
@@ -177,10 +181,12 @@ async def upload_image_max(image_path: str) -> Optional[str]:
                     try:
                         import json
                         resp = json.loads(last_body) if last_body.strip() else {}
-                    except Exception:
+                    except ValueError:
                         resp = {}
                 elif r.status == 400:
                     logger.debug("MAX POST /uploads 400: %s", last_body[:300])
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug("MAX upload request: %s", e)
     if not resp or not isinstance(resp, dict):
@@ -203,7 +209,7 @@ async def upload_image_max(image_path: str) -> Optional[str]:
                 try:
                     import json
                     data = json.loads(text)
-                except Exception:
+                except ValueError:
                     data = {}
                 if isinstance(data, dict):
                     t = data.get("token") or data.get("file_token") or data.get("photo_id") or data.get("file_id") or data.get("id")
@@ -224,6 +230,8 @@ async def upload_image_max(image_path: str) -> Optional[str]:
                     async with session.post(upload_url, data=raw, headers={"Content-Type": mime_type}, timeout=aiohttp.ClientTimeout(total=30)) as up_resp:
                         if up_resp.status < 400:
                             token = await _parse_token(up_resp)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning("MAX upload file POST, попытка %s: %s", attempt + 1, e)
                 if attempt < 2:
@@ -244,6 +252,8 @@ async def upload_image_max(image_path: str) -> Optional[str]:
                                 "MAX upload_image_max: POST по upload_url вернул status=%s, body=%s",
                                 up_resp.status, err_body,
                             )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.debug("MAX upload multipart: %s", e)
     if not token:
@@ -268,6 +278,8 @@ async def upload_file_max(file_path: str, mime_type: Optional[str] = None) -> Op
         return None
     try:
         raw = path.read_bytes()
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning("MAX: не удалось прочитать файл %s: %s", file_path, e)
         return None
@@ -291,8 +303,10 @@ async def upload_file_max(file_path: str, mime_type: Optional[str] = None) -> Op
                     try:
                         import json
                         resp = json.loads(last_body) if last_body.strip() else {}
-                    except Exception:
+                    except ValueError:
                         resp = {}
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.debug("MAX upload file request: %s", e)
     if not resp or not isinstance(resp, dict):
@@ -316,7 +330,7 @@ async def upload_file_max(file_path: str, mime_type: Optional[str] = None) -> Op
                     data = json.loads(text)
                     if isinstance(data, dict):
                         return data.get("token") or data.get("file_token") or data.get("document_id") or data.get("file_id") or data.get("id")
-                except Exception:
+                except ValueError:
                     pass
             return None
         token = None
@@ -326,6 +340,8 @@ async def upload_file_max(file_path: str, mime_type: Optional[str] = None) -> Op
                     async with session.post(upload_url, data=raw, headers={"Content-Type": mime}, timeout=aiohttp.ClientTimeout(total=30)) as up_resp:
                         if up_resp.status < 400:
                             token = await _parse_token(up_resp)
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning("MAX upload file POST, попытка %s: %s", attempt + 1, e)
                 if attempt < 2:

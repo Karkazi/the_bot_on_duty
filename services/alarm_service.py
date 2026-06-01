@@ -3,6 +3,7 @@
 Содержит бизнес-логику создания, управления и закрытия аварий.
 """
 import logging
+import asyncio
 import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Optional
@@ -10,7 +11,8 @@ from typing import Dict, Optional
 from bot_state import BotState
 from utils.exceptions import NotFoundError, ValidationError
 from utils.datetime_utils import safe_parse_datetime
-from domain.constants import DATETIME_FORMAT
+from domain.constants import DATETIME_FORMAT, format_alarm_service_for_display
+from utils.bot_time import bot_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -57,7 +59,7 @@ class AlarmService:
         if not issue or not issue.strip():
             raise ValidationError("Описание проблемы не может быть пустым", "issue")
         
-        if fix_time < datetime.now():
+        if fix_time < bot_now_naive():
             raise ValidationError("Время исправления не может быть в прошлом", "fix_time")
         
         if not service:
@@ -74,7 +76,7 @@ class AlarmService:
             "issue": issue,
             "fix_time": fix_time.isoformat() if isinstance(fix_time, datetime) else fix_time,
             "user_id": user_id,
-            "created_at": datetime.now().isoformat(),
+            "created_at": bot_now_naive().isoformat(),
             "jira_key": jira_key,
             "has_jira": has_jira,
             "scm_topic_id": scm_topic_id
@@ -221,7 +223,7 @@ class AlarmService:
                 description=description,
                 problem_level=problem_level or PROBLEM_LEVEL_POTENTIAL,
                 problem_service=service,
-                time_start_problem=datetime.now().strftime("%Y-%m-%d %H:%M"),
+                time_start_problem=bot_now_naive().strftime("%Y-%m-%d %H:%M"),
                 influence=INFLUENCE_CLIENTS
             )
             
@@ -231,6 +233,8 @@ class AlarmService:
             else:
                 logger.error("Не удалось получить ID задачи из Jira")
                 return None
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Ошибка создания задачи в Jira: {e}", exc_info=True)
             return None
@@ -251,7 +255,10 @@ class AlarmService:
             Отформатированное сообщение
         """
         issue = alarm_data.get("issue", "не указано")
-        service = alarm_data.get("service", "не указан")
+        service = format_alarm_service_for_display(
+            alarm_data.get("service"),
+            alarm_data.get("service_other_spec"),
+        )
         fix_time_str = alarm_data.get("fix_time", "")
         
         try:
@@ -259,8 +266,8 @@ class AlarmService:
                 fix_time = datetime.fromisoformat(fix_time_str)
             else:
                 fix_time = fix_time_str
-        except Exception:
-            fix_time = datetime.now()
+        except ValueError:
+            fix_time = bot_now_naive()
         
         message = (
             f"🚨 Технический сбой\n"

@@ -13,6 +13,9 @@ from config import CONFIG
 
 logger = logging.getLogger(__name__)
 
+# Префикс object_id для комментариев к постам c_portal_news на Петлокале
+PETLOCAL_OBJECT_ID_PREFIX = "026bd370-ba01-6410-0278-"
+
 
 class SimpleOneService:
     """Сервис для работы с SimpleOne API"""
@@ -65,6 +68,8 @@ class SimpleOneService:
                     update_env_token(new_token)
                 logger.info("Токен SimpleOne успешно обновлён (автоматически)")
                 return True
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("Не удалось обновить токен SimpleOne: %s", e, exc_info=True)
         return False
@@ -188,7 +193,9 @@ class SimpleOneService:
                             "created_post": created_post,
                             "status": response.status
                         }
-                    except Exception as e:
+                    except asyncio.CancelledError:
+                        raise
+                    except (aiohttp.ContentTypeError, ValueError, TypeError) as e:
                         logger.warning("Не удалось распарсить JSON ответ: %s, текст: %s", e, response_text[:500], exc_info=True)
                         return {
                             "success": True,
@@ -223,7 +230,9 @@ class SimpleOneService:
                                         "created_post": created_post,
                                         "status": response2.status
                                     }
-                                except Exception as parse_err:
+                                except asyncio.CancelledError:
+                                    raise
+                                except (aiohttp.ContentTypeError, ValueError, TypeError) as parse_err:
                                     logger.warning("Повторный запрос SimpleOne: не удалось распарсить JSON: %s", parse_err)
                                     return {
                                         "success": True,
@@ -232,7 +241,7 @@ class SimpleOneService:
                                     }
                     try:
                         error_data = json.loads(response_text) if response_text else None
-                    except Exception as parse_err:
+                    except ValueError as parse_err:
                         logger.debug("Не удалось распарсить тело ошибки: %s", parse_err)
                         error_data = None
                     error_msg = self._get_error_message(response.status, error_data, response_text)
@@ -252,12 +261,144 @@ class SimpleOneService:
                 "success": False,
                 "error": f"Ошибка сети: {e}"
             }
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.error(f"Неожиданная ошибка при публикации в SimpleOne: {e}", exc_info=True)
             return {
                 "success": False,
                 "error": f"Неожиданная ошибка: {e}"
             }
+
+    @staticmethod
+    def petlocal_object_id(post_sys_id: str) -> str:
+        """UUID объекта поста для c_portal_comment (как в UI Петлокала)."""
+        hex_suffix = f"{int(post_sys_id):032x}"[-12:]
+        return f"{PETLOCAL_OBJECT_ID_PREFIX}{hex_suffix}"
+
+    @staticmethod
+    def format_comment_html(text: str) -> str:
+        escaped = SimpleOneService._escape_html(text)
+        return (
+            '<p class="editor-paragraph">'
+            f'<span style="white-space: pre-wrap;">{escaped}</span></p>'
+        )
+
+    @staticmethod
+    def _unwrap_record_value(field: Any) -> Any:
+        if isinstance(field, dict) and "value" in field:
+            return field["value"]
+        return field
+
+    async def add_portal_comment(
+        self,
+        post_sys_id: str,
+        comment_text: str,
+        *,
+        author_id: Optional[str] = None,
+        object_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        """
+        Добавляет комментарий к посту на Петлокале (таблица c_portal_comment).
+        object_id по умолчанию вычисляется из sys_id поста (hex-суффикс, как в UI).
+        """
+        if not self._is_configured():
+            return {"success": False, "error": "SimpleOne не настроен в конфигурации"}
+        if not post_sys_id or not comment_text:
+            return {"success": False, "error": "post_sys_id и comment_text обязательны"}
+
+        oid = object_id or self.petlocal_object_id(post_sys_id)
+        aid = author_id
+        if not aid:
+            try:
+                async with self.session.get(
+                    f"{self.base_url.rstrip('/')}/rest/v1/table/c_portal_news/{post_sys_id}",
+                    headers={"Authorization": f"Bearer {self._get_token()}"},
+                ) as resp:
+                    if resp.status == 200:
+                        data = await resp.json()
+                        row = (data.get("data") or [{}])[0]
+                        aid = self._unwrap_record_value(row.get("author_id"))
+            except asyncio.CancelledError:
+                raise
+            except Exception as e:
+                logger.warning("Не удалось получить author_id поста %s: %s", post_sys_id, e)
+
+        if not aid:
+            return {"success": False, "error": "author_id не задан и не найден у поста"}
+
+        url = f"{self.base_url.rstrip('/')}/rest/v1/table/c_portal_comment"
+        headers = {
+            "Authorization": f"Bearer {self._get_token()}",
+            "Content-Type": "application/json",
+        }
+        payload = {
+            "text": self.format_comment_html(comment_text),
+            "object_id": oid,
+            "author_id": str(aid),
+        }
+
+        try:
+            async with self.session.post(url, json=payload, headers=headers) as response:
+                response_text = await response.text()
+                if response.status in (200, 201):
+                    try:
+                        response_data = await response.json()
+                        created = None
+                        if isinstance(response_data, dict):
+                            rows = response_data.get("data")
+                            if isinstance(rows, list) and rows:
+                                created = rows[0]
+                        return {
+                            "success": True,
+                            "status": response.status,
+                            "data": response_data,
+                            "created_comment": created,
+                            "object_id": oid,
+                            "post_sys_id": post_sys_id,
+                        }
+                    except (aiohttp.ContentTypeError, ValueError, TypeError):
+                        return {
+                            "success": True,
+                            "status": response.status,
+                            "data": {"raw_response": response_text},
+                            "object_id": oid,
+                            "post_sys_id": post_sys_id,
+                        }
+                if response.status == 401 and await self._refresh_token_if_configured():
+                    headers["Authorization"] = f"Bearer {self._get_token()}"
+                    async with self.session.post(url, json=payload, headers=headers) as response2:
+                        response_text2 = await response2.text()
+                        if response2.status in (200, 201):
+                            response_data = await response2.json()
+                            rows = response_data.get("data") if isinstance(response_data, dict) else None
+                            created = rows[0] if isinstance(rows, list) and rows else None
+                            return {
+                                "success": True,
+                                "status": response2.status,
+                                "data": response_data,
+                                "created_comment": created,
+                                "object_id": oid,
+                                "post_sys_id": post_sys_id,
+                            }
+                try:
+                    error_data = json.loads(response_text) if response_text else None
+                except ValueError:
+                    error_data = None
+                error_msg = self._get_error_message(response.status, error_data, response_text)
+                return {
+                    "success": False,
+                    "error": error_msg,
+                    "status": response.status,
+                    "data": error_data,
+                }
+        except aiohttp.ClientError as e:
+            return {"success": False, "error": f"Ошибка сети: {e}"}
+        except asyncio.CancelledError:
+            raise
+        except Exception as e:
+            logger.error("Ошибка добавления комментария на Петлокал: %s", e, exc_info=True)
+            return {"success": False, "error": str(e)}
 
     async def get_latest_portal_posts(self, limit: int = 20) -> Dict[str, Any]:
         """
@@ -297,6 +438,8 @@ class SimpleOneService:
                         filtered.append(row)
 
                 return {"success": True, "status": response.status, "data": filtered}
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             return {"success": False, "error": str(e)}
 
@@ -311,7 +454,6 @@ class SimpleOneService:
     def format_maintenance_closed_for_petlocal(self, work_id: str, description: str, closed_at: str) -> str:
         """Форматирует пост о завершении работ для публикации на Петлокале (HTML)."""
         html = "<h2>✅ Работы завершены</h2>\n"
-        html += f"<p><strong>ID:</strong> {self._escape_html(work_id)}</p>\n"
         html += f"<p><strong>Описание:</strong> {self._escape_html(description)}</p>\n"
         html += f"<p><strong>Время завершения:</strong> {self._escape_html(closed_at)}</p>"
         return html

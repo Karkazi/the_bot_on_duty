@@ -4,6 +4,7 @@
 from datetime import datetime as dt, timedelta
 from typing import Tuple, Optional
 from domain.constants import MAINTENANCE_TIME_SPINNER_CONFIG, MAINTENANCE_TIME_STEPS_ORDER
+from utils.bot_time import bot_now_naive
 import logging
 
 logger = logging.getLogger(__name__)
@@ -143,7 +144,7 @@ class MaintenanceTimeSpinner:
         Returns:
             datetime объект
         """
-        now = dt.now()
+        now = bot_now_naive()
         target_date = now + timedelta(days=days_offset)
         return target_date.replace(hour=hour, minute=minute, second=0, microsecond=0)
     
@@ -170,8 +171,8 @@ class MaintenanceTimeSpinner:
             "июля", "августа", "сентября", "октября", "ноября", "декабря"
         ]
         
-        start_date = dt.now() + timedelta(days=date_offset)
-        end_date = dt.now() + timedelta(days=date_end_offset)
+        start_date = bot_now_naive() + timedelta(days=date_offset)
+        end_date = bot_now_naive() + timedelta(days=date_end_offset)
         
         time_start = f"{hour_start:02d}:{minute_start:02d}"
         time_end = f"{hour_end:02d}:{minute_end:02d}"

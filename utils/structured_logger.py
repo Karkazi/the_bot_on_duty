@@ -7,6 +7,8 @@ import json
 from datetime import datetime
 from typing import Any, Dict
 
+from utils.app_paths import BOT_LOG_FILE
+
 
 class JSONFormatter(logging.Formatter):
     """
@@ -146,8 +148,8 @@ def setup_structured_logging(use_json: bool = False, level: int = logging.INFO):
     else:
         formatter = logging.Formatter(log_format)
     
-    # Логирование в файл
-    file_handler = logging.FileHandler("bot.log", encoding="utf-8")
+    # Логирование в файл (всегда каталог проекта, не cwd)
+    file_handler = logging.FileHandler(BOT_LOG_FILE, encoding="utf-8")
     file_handler.setLevel(level)
     file_handler.setFormatter(formatter)
     

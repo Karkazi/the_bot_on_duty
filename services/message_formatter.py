@@ -5,7 +5,7 @@
 from datetime import datetime
 from typing import Dict, Optional
 
-from domain.constants import DATETIME_FORMAT
+from domain.constants import DATETIME_FORMAT, format_alarm_service_for_display
 from config import ktalk_emergency_url
 
 
@@ -27,18 +27,18 @@ class MessageFormatter:
         description: str,
         service: str,
         jira_url: Optional[str] = None,
-        scm_topic_url: Optional[str] = None,
         max_chat_url: Optional[str] = None,
         ktalk_url: Optional[str] = None,
+        service_other_spec: Optional[str] = None,
     ) -> str:
         """
-        Единый формат уведомления о сбое для Telegram и MAX (HTML).
-        Важно: alarm_id, Telegram, MAX должны оставаться кликабельными ссылками.
+        Единый формат уведомления о сбое для MAX (HTML).
         """
+        service_line = format_alarm_service_for_display(service, service_other_spec)
         lines = [
             "🚨 Технический сбой",
             f"📋 {description}",
-            f"📋 Сервис: {service}",
+            f"📋 Сервис: {service_line}",
         ]
 
         if jira_url:
@@ -47,9 +47,6 @@ class MessageFormatter:
             lines.append(f"🔗 Jira: {alarm_id}")
 
         lines.append(
-            "💬 Обсуждение: тема в канале SCM (" + MessageFormatter._link(scm_topic_url, "Telegram") + ")."
-        )
-        lines.append(
             "💬 Чат сбоя: " + MessageFormatter._link(max_chat_url, "MAX") + "."
         )
 
@@ -57,6 +54,30 @@ class MessageFormatter:
             # Делаем ссылкой сам URL — и в TG, и в MAX будет кликабельно.
             lines.append("💬 Ссылка в Ктолк: " + MessageFormatter._link(ktalk_url, ktalk_url))
 
+        return "\n".join(lines)
+
+    @staticmethod
+    def format_alarm_fa_text(
+        *,
+        alarm_id: str,
+        description: str,
+        service: str,
+        jira_key: Optional[str] = None,
+        service_other_spec: Optional[str] = None,
+        ktalk_url: Optional[str] = None,
+    ) -> str:
+        """
+        Текст первого сообщения в FA-чате при создании сбоя (без HTML).
+        """
+        service_line = format_alarm_service_for_display(service, service_other_spec)
+        lines = [
+            "🚨 Технический сбой",
+            f"📋 {description}",
+            f"📋 Сервис: {service_line}",
+            f"🔗 Jira: {jira_key or alarm_id}",
+        ]
+        if ktalk_url:
+            lines.append(f"💬 Ссылка в Ктолк: {ktalk_url}")
         return "\n".join(lines)
     
     @staticmethod

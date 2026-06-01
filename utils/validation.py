@@ -5,7 +5,12 @@
 import re
 import html
 from typing import Optional, Tuple
-from domain.constants import MAX_TITLE_LENGTH, MAX_DESCRIPTION_LENGTH, MAX_MESSAGE_TEXT_LENGTH
+from domain.constants import (
+    MAX_TITLE_LENGTH,
+    MAX_DESCRIPTION_LENGTH,
+    MAX_MESSAGE_TEXT_LENGTH,
+    MAX_SERVICE_OTHER_SPEC_LENGTH,
+)
 
 
 def sanitize_html(text: str) -> str:
@@ -60,6 +65,15 @@ def validate_description(description: str) -> Tuple[bool, Optional[str]]:
     if not description or not description.strip():
         return False, "⚠️ Описание не может быть пустым"
     return validate_text_length(description, MAX_DESCRIPTION_LENGTH, "описание")
+
+
+def validate_service_other_spec(text: str) -> Tuple[bool, Optional[str]]:
+    """
+    Уточнение для сервиса «Другое» при заведении сбоя.
+    """
+    if not text or not text.strip():
+        return False, "⚠️ Кратко опишите, какой это сервис (поле «Другое»)."
+    return validate_text_length(text.strip(), MAX_SERVICE_OTHER_SPEC_LENGTH, "уточнение")
 
 
 def validate_message_text(text: str) -> Tuple[bool, Optional[str]]:

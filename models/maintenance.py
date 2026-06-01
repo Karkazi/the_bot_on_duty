@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator, model_validator
 
+from utils.bot_time import bot_now_naive
+
 
 class MaintenanceCreateRequest(BaseModel):
     """Модель для создания регламентной работы"""
@@ -17,7 +19,7 @@ class MaintenanceCreateRequest(BaseModel):
     @classmethod
     def validate_start_time(cls, v: datetime) -> datetime:
         """Проверяет, что время начала не в прошлом"""
-        if v < datetime.now():
+        if v < bot_now_naive():
             raise ValueError("Время начала не может быть в прошлом")
         return v
     

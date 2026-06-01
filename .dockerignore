@@ -131,10 +131,8 @@ celerybeat.pid
 .env
 .env.test
 README.md
+docs/
 tests/
-duty-bot.tar
-*.tar
-data/tmp/
 .env.prod
 .venv
 env/
@@ -186,7 +184,6 @@ screenshot.png
 screenshot.png
 data/state.json
 data/archive/
-data/logs/
 bot.log
 config.json
 .cursorrules

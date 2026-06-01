@@ -5,6 +5,7 @@
 """
 import re
 import logging
+import asyncio
 from typing import Optional, List, Dict, Any
 
 import aiohttp
@@ -105,6 +106,8 @@ class MaxService:
                         err_body[:500],
                     )
                     return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Ошибка при отправке сообщения в MAX: %s", e)
             return False
@@ -156,6 +159,8 @@ class MaxService:
                         err_body[:300],
                     )
                     return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Ошибка send_message_to_user MAX: %s", e)
             return False
@@ -199,6 +204,8 @@ class MaxService:
                         err_body[:500],
                     )
                     return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.exception("Ошибка при отправке сообщения с вложениями в MAX: %s", e)
             return False
@@ -230,6 +237,8 @@ class MaxService:
                         logger.warning("MAX get_messages: status=%s, body=%s", response.status, err[:300])
                         return None
                     data = await response.json()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX get_messages: %s", e)
             return None
@@ -300,6 +309,8 @@ class MaxService:
                     err = await response.text()
                     logger.warning("MAX clear_chat_messages: status=%s, body=%s", response.status, err[:200])
                     return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX clear_chat_messages: %s", e)
             return False
@@ -329,6 +340,8 @@ class MaxService:
                             continue
                         err = await response.text()
                         logger.debug("MAX delete_message %s: status=%s body=%s", param_name, response.status, err[:200])
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning("MAX delete_message (%s): %s", param_name, e)
         return False
@@ -357,6 +370,8 @@ class MaxService:
                     err = await response.text()
                     logger.warning("MAX set_chat_title: status=%s, body=%s", response.status, err[:300])
                     return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX set_chat_title: %s", e)
             return False
@@ -378,6 +393,8 @@ class MaxService:
                     if response.status != 200:
                         return None
                     return await response.json()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX get_chat: %s", e)
             return None
@@ -403,6 +420,8 @@ class MaxService:
                     err = await response.text()
                     logger.warning("MAX delete_chat: status=%s, body=%s", response.status, err[:300])
                     return False
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX delete_chat: %s", e)
             return False

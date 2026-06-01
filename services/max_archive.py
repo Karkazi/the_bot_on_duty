@@ -5,6 +5,7 @@
 - Если задачи в JIRA нет: сохраняем на диск, очищаем чат.
 """
 import logging
+import asyncio
 import os
 import tempfile
 from datetime import datetime
@@ -13,12 +14,13 @@ from typing import Any, Dict, List, Optional
 
 from services.max_service import MaxService
 from services.max_media import download_attachment_max
+from utils.app_paths import APP_DATA_DIR
 from utils.jira_comment import add_comment_to_jira_issue
 from utils.jira_attachments import add_attachments_to_jira_issue
 
 logger = logging.getLogger(__name__)
 
-ARCHIVE_DIR = Path(__file__).resolve().parent.parent / "data" / "archive" / "alarms"
+ARCHIVE_DIR = APP_DATA_DIR / "archive" / "alarms"
 
 
 def _format_messages_for_file(messages: List[Dict[str, Any]]) -> str:
@@ -165,6 +167,8 @@ async def process_max_chat_on_alarm_close(
                 expected_attachments == 0
                 or (attachment_paths and attempted_count > 0 and added_count == attempted_count)
             )
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("Не удалось добавить вложения из чата MAX в JIRA %s: %s", jira_key, e)
             attachments_ok = False
@@ -172,6 +176,8 @@ async def process_max_chat_on_alarm_close(
             try:
                 if os.path.isfile(p):
                     os.unlink(p)
+            except asyncio.CancelledError:
+                raise
             except Exception:
                 pass
         if added and attachments_ok:

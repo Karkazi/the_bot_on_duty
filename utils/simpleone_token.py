@@ -128,7 +128,9 @@ def update_env_token(token: str, env_path: Optional[Path] = None) -> bool:
         True если запись прошла успешно.
     """
     if env_path is None:
-        env_path = Path(__file__).resolve().parent.parent / ".env"
+        from utils.paths_bootstrap import PROJECT_ROOT
+
+        env_path = PROJECT_ROOT / ".env"
     if not env_path.exists():
         logger.debug("Файл .env не найден для обновления токена: %s", env_path)
         return False

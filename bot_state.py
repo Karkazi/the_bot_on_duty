@@ -8,12 +8,12 @@ from pathlib import Path
 from typing import Dict, Any, Optional
 from collections import deque
 import logging
-from aiogram.fsm.state import State
-from config import CONFIG
+from utils.app_paths import APP_DATA_DIR
+from config import CONFIG, is_max_admin
 
 logger = logging.getLogger(__name__)
-# Путь к файлу состояния относительно корня пакета (не зависит от CWD при запуске)
-STATE_FILE = str(Path(__file__).resolve().parent / "data" / "state.json")
+# Состояние в каталоге данных (BOT_APP_DATA_DIR или <проект>/data), см. utils.paths_bootstrap
+STATE_FILE = str(APP_DATA_DIR / "state.json")
 os.makedirs(os.path.dirname(STATE_FILE), exist_ok=True)
 
 
@@ -50,7 +50,8 @@ class BotState:
         self.active_maintenances: Dict[str, Dict] = {}
         # Работы из Confluence: work_id -> {status, description, start_time_str, end_time_str, ...} для детекции новых и кнопок Информировать/Пропустить
         self.known_maintenances_from_confluence: Dict[str, Dict] = {}
-
+        # Ежедневная сводка календаря: "YYYY-MM-DD" -> ["10:00", "18:00"]
+        self.calendar_digest_sent: Dict[str, list] = {}
         # Очередь для асинхронного сохранения
         self._use_queue = use_queue
         self._save_queue = None
@@ -60,9 +61,7 @@ class BotState:
 
     def get_user_active_alarms(self, user_id: int) -> dict:
         """Все сбои для админа/суперадмина, иначе только созданные пользователем."""
-        admin_ids = CONFIG.get("TELEGRAM", {}).get("ADMIN_IDS", [])
-        superadmin_ids = CONFIG.get("TELEGRAM", {}).get("SUPERADMIN_IDS", [])
-        if user_id in admin_ids or user_id in superadmin_ids:
+        if is_max_admin(user_id):
             return dict(self.active_alarms)
         return {
             aid: alarm for aid, alarm in self.active_alarms.items()
@@ -71,9 +70,7 @@ class BotState:
 
     def get_user_active_maintenances(self, user_id: int) -> dict:
         """Все работы для админа/суперадмина, иначе только созданные пользователем."""
-        admin_ids = CONFIG.get("TELEGRAM", {}).get("ADMIN_IDS", [])
-        superadmin_ids = CONFIG.get("TELEGRAM", {}).get("SUPERADMIN_IDS", [])
-        if user_id in admin_ids or user_id in superadmin_ids:
+        if is_max_admin(user_id):
             return dict(self.active_maintenances)
         return {
             wid: work for wid, work in self.active_maintenances.items()
@@ -105,13 +102,14 @@ class BotState:
 
     async def save_state(self):
         """Сохраняет текущее состояние бота в файл"""
-        logger.info("💾 Начинаю сохранение состояния бота")
+        logger.debug("💾 Начинаю сохранение состояния бота")
 
         state = {
             'active_alarms': {},
             'active_maintenances': {},
             'user_states': {},
             'known_maintenances_from_confluence': {},
+            'calendar_digest_sent': {},
         }
 
         async with self._lock:  # Используем async with для асинхронной блокировки
@@ -135,6 +133,7 @@ class BotState:
                     'max_chat_id': alarm.get('max_chat_id'),  # Чат MAX для обсуждения сбоя (FA-XXXX), архивация при закрытии
                     # Дополнительные поля (опционально)
                     'service': alarm.get('service'),
+                    'service_other_spec': alarm.get('service_other_spec'),
                     'description': alarm.get('description'),
                     'petlocal_post_id': alarm.get('petlocal_post_id'),
                     'petlocal_object_id': alarm.get('petlocal_object_id'),
@@ -166,18 +165,24 @@ class BotState:
             for work_id, work in self.known_maintenances_from_confluence.items():
                 start_time = work.get("start_time")
                 end_time = work.get("end_time")
+                inform_at = work.get("inform_at")
                 state['known_maintenances_from_confluence'][work_id] = {
-                    **{k: v for k, v in work.items() if k not in ("start_time", "end_time")},
+                    **{k: v for k, v in work.items() if k not in ("start_time", "end_time", "inform_at")},
                     "start_time": start_time.isoformat() if isinstance(start_time, datetime) else start_time,
                     "end_time": end_time.isoformat() if isinstance(end_time, datetime) else end_time,
+                    "inform_at": inform_at.isoformat() if isinstance(inform_at, datetime) else inform_at,
                 }
+
+            state["calendar_digest_sent"] = {
+                str(day): list(slots) for day, slots in (self.calendar_digest_sent or {}).items() if slots
+            }
 
             # --- Сохранение пользовательских состояний ---
             for user_id, user_state in self.user_states.items():
                 logger.debug(f"💾 Сохраняю состояние пользователя: {user_id}")
                 # Сохраняем все поля user_state для полноты
                 saved_state = {
-                    'state': user_state.get('state').name if isinstance(user_state.get('state'), State) else user_state.get('state'),
+                    'state': getattr(user_state.get('state'), 'name', user_state.get('state')),
                     'alarm_id': user_state.get('alarm_id'),
                     'issue': user_state.get('issue'),
                     'type': user_state.get('type'),  # Для напоминаний: "reminder" или "maintenance_reminder"
@@ -241,6 +246,7 @@ class BotState:
                 'active_maintenances': {},
                 'user_states': {},
                 'known_maintenances_from_confluence': {},
+                'calendar_digest_sent': {},
             }
 
         except json.JSONDecodeError as je:
@@ -264,6 +270,7 @@ class BotState:
                 'active_maintenances': {},
                 'user_states': {},
                 'known_maintenances_from_confluence': {},
+                'calendar_digest_sent': {},
             }
             logger.info("🆕 Используется новое пустое состояние")
 
@@ -275,6 +282,7 @@ class BotState:
                 'active_maintenances': {},
                 'user_states': {},
                 'known_maintenances_from_confluence': {},
+                'calendar_digest_sent': {},
             }
 
         # Загружаем данные из data (может быть пустым при ошибках)
@@ -284,6 +292,7 @@ class BotState:
                 self.active_maintenances.clear()
                 self.user_states.clear()
                 self.known_maintenances_from_confluence.clear()
+                self.calendar_digest_sent.clear()
 
             # --- Загрузка аварий ---
             for alarm_id, alarm_data in data.get("active_alarms", {}).items():
@@ -320,6 +329,7 @@ class BotState:
                         "max_chat_id": alarm_data.get("max_chat_id"),  # Чат MAX для обсуждения сбоя (FA-XXXX)
                         # Дополнительные поля (опционально)
                         "service": alarm_data.get("service"),
+                        "service_other_spec": alarm_data.get("service_other_spec"),
                         "description": alarm_data.get("description"),
                         "petlocal_post_id": alarm_data.get("petlocal_post_id"),
                         "petlocal_object_id": alarm_data.get("petlocal_object_id"),
@@ -395,6 +405,7 @@ class BotState:
                 try:
                     start_time = safe_parse_time(work_data.get("start_time"))
                     end_time = safe_parse_time(work_data.get("end_time"))
+                    inform_at = safe_parse_time(work_data.get("inform_at"))
                     if start_time is None or end_time is None:
                         continue
                     self.known_maintenances_from_confluence[work_id] = {
@@ -407,9 +418,17 @@ class BotState:
                         "owner": work_data.get("owner", ""),
                         "start_time": start_time,
                         "end_time": end_time,
+                        "inform_at": inform_at,
+                        "inform_at_str": work_data.get("inform_at_str", ""),
                     }
                 except Exception as e:
                     logger.debug("Пропущена запись known_confluence %s: %s", work_id, e)
+
+            raw_digest = data.get("calendar_digest_sent") or {}
+            if isinstance(raw_digest, dict):
+                for day_key, slots in raw_digest.items():
+                    if isinstance(slots, list):
+                        self.calendar_digest_sent[str(day_key)] = [str(s) for s in slots]
 
         except Exception as e:
             logger.error(f"❌ Ошибка при обработке данных состояния: {e}", exc_info=True)

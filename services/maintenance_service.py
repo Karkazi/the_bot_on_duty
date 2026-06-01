@@ -11,6 +11,7 @@ from bot_state import BotState
 from utils.exceptions import NotFoundError, ValidationError
 from utils.datetime_utils import safe_parse_datetime
 from domain.constants import DATETIME_FORMAT
+from utils.bot_time import bot_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -53,7 +54,7 @@ class MaintenanceService:
         if not description or not description.strip():
             raise ValidationError("Описание работ не может быть пустым", "description")
         
-        if start_time < datetime.now():
+        if start_time < bot_now_naive():
             raise ValidationError("Время начала не может быть в прошлом", "start_time")
         
         if end_time <= start_time:
@@ -69,7 +70,7 @@ class MaintenanceService:
             "end_time": end_time.isoformat() if isinstance(end_time, datetime) else end_time,
             "unavailable_services": unavailable_services,
             "user_id": user_id,
-            "created_at": datetime.now().isoformat()
+            "created_at": bot_now_naive().isoformat()
         }
         
         logger.info(f"Создана работа {work_id} пользователем {user_id}")

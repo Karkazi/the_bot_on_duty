@@ -1,14 +1,17 @@
 # adapters/max/create_flow.py — сценарий «Сообщить» в MAX (сбой / работа / обычное)
 
 import logging
+import asyncio
 from datetime import datetime as dt, timedelta
 
 from config import PROBLEM_SERVICES
-from domain.constants import DATETIME_FORMAT
+from domain.constants import DATETIME_FORMAT, PROBLEM_SERVICE_OTHER
+from utils.bot_time import bot_now_naive
 from utils.validation import (
     validate_description,
     validate_message_text,
     validate_datetime_format,
+    validate_service_other_spec,
     sanitize_html,
 )
 from utils.datetime_utils import parse_flexible_datetime
@@ -66,7 +69,7 @@ def _services_list_plain() -> str:
     return "\n".join(lines)
 
 
-async def handle_create_message(event, reply_fn, user_id: int, text: str, telegram_bot=None) -> bool:
+async def handle_create_message(event, reply_fn, user_id: int, text: str) -> bool:
     """
     Обрабатывает сообщение в контексте сценария «Сообщить».
     Возвращает True если сообщение обработано (сессия была или начата).
@@ -143,7 +146,13 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
             idx = int(text)
             if 1 <= idx <= len(PROBLEM_SERVICES):
                 service = PROBLEM_SERVICES[idx - 1]
-                update_session_data(user_id, service=service)
+                update_session_data(user_id, service=service, service_other_spec=None)
+                if service == PROBLEM_SERVICE_OTHER:
+                    set_session(user_id, "enter_service_other_spec")
+                    await reply_fn(
+                        "✏️ Уточните, какой это сервис (поле «Другое»). Текстом, до 500 символов, или «отмена»."
+                    )
+                    return True
                 set_session(user_id, "select_jira")
                 # В MAX показываем кнопки «Да» / «Нет»
                 await reply_fn("📋 Создать задачу в Jira?", "jira_keyboard")
@@ -153,10 +162,20 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
         await reply_fn(f"Введите номер от 1 до {len(PROBLEM_SERVICES)}.")
         return True
 
+    if step == "enter_service_other_spec" and msg_type == "alarm":
+        ok, err = validate_service_other_spec(text)
+        if not ok:
+            await reply_fn(err or "Неверный ввод.")
+            return True
+        update_session_data(user_id, service_other_spec=sanitize_html(text.strip()))
+        set_session(user_id, "select_jira")
+        await reply_fn("📋 Создать задачу в Jira?", "jira_keyboard")
+        return True
+
     if step == "select_jira" and msg_type == "alarm":
         if text_lower in ("да", "yes", "1"):
             update_session_data(user_id, create_jira=True)
-            now = dt.now()
+            now = bot_now_naive()
             fix_time = now + timedelta(hours=1)
             update_session_data(user_id, fix_time=fix_time.isoformat())
             set_session(user_id, "select_petlocal")
@@ -168,28 +187,17 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
             return True
         if text_lower in ("нет", "no", "0"):
             update_session_data(user_id, create_jira=False)
-            set_session(user_id, "select_scm")
-            # В MAX показываем кнопки «Завести в SCM» / «Не заводить в SCM»
-            await reply_fn("📋 Завести тему в канале SCM?", "scm_keyboard")
+            now = bot_now_naive()
+            fix_time = now + timedelta(hours=1)
+            update_session_data(user_id, fix_time=fix_time.isoformat())
+            set_session(user_id, "select_petlocal")
+            await reply_fn(
+                f"Исправим до: {fix_time.strftime(DATETIME_FORMAT)}.\n"
+                "📢 Публиковать на Петлокале?",
+                "petlocal_keyboard",
+            )
             return True
         await reply_fn("Напишите да или нет.")
-        return True
-
-    if step == "select_scm" and msg_type == "alarm":
-        # Обработка текста «да»/«нет» (callback scm_create/scm_skip обрабатывается в handlers)
-        if text_lower in ("да", "yes"):
-            update_session_data(user_id, create_scm=True)
-        else:
-            update_session_data(user_id, create_scm=False)
-        now = dt.now()
-        fix_time = now + timedelta(hours=1)
-        update_session_data(user_id, fix_time=fix_time.isoformat())
-        set_session(user_id, "select_petlocal")
-        await reply_fn(
-            f"Исправим до: {fix_time.strftime(DATETIME_FORMAT)}.\n"
-            "📢 Публиковать на Петлокале?",
-            "petlocal_keyboard",
-        )
         return True
 
     # --- Работа ---
@@ -283,6 +291,8 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
                 if att.get("type") in ("image", "photo") and url.startswith("http"):
                     image_url = url
                     break
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug("MAX regular photo: не удалось извлечь вложение: %s", e)
 
@@ -313,6 +323,8 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
                                     image_url = url
                                     logger.info("MAX regular photo: вложение восстановлено через get_messages (mid=%s)", mid)
                                     break
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.debug("MAX regular photo: fallback get_messages не сработал: %s", e)
 
@@ -411,29 +423,28 @@ async def handle_create_message(event, reply_fn, user_id: int, text: str, telegr
         if text_lower not in ("да", "подтвердить", "yes"):
             await reply_fn("Напишите «да» или «подтвердить» для отправки.")
             return True
-        await _execute_confirmation(user_id, reply_fn, telegram_bot)
+        await _execute_confirmation(user_id, reply_fn)
         return True
 
     return True
 
 
-async def _execute_confirmation(user_id: int, reply_fn, telegram_bot) -> None:
+async def _execute_confirmation(user_id: int, reply_fn) -> None:
     """Выполняет отправку по данным сессии (вызывается из текста или callback в MAX)."""
-    if not telegram_bot:
-        await reply_fn("❌ Сервис недоступен (нет связи с Telegram ботом).")
-        return
     session = get_session(user_id)
     data = (session or {}).get("data", {})
     msg_type = data.get("type")
     try:
         if msg_type == "alarm":
-            await create_alarm(data, telegram_bot, reply_fn, user_id)
+            await create_alarm(data, reply_fn, user_id, author_messenger="max")
         elif msg_type == "maintenance":
-            await create_maintenance(data, telegram_bot, reply_fn, user_id)
+            await create_maintenance(data, reply_fn, user_id, author_messenger="max")
         elif msg_type == "regular":
-            await send_regular_message(data, telegram_bot, reply_fn, user_id)
+            await send_regular_message(data, reply_fn, user_id)
         else:
             await reply_fn("❌ Неизвестный тип сообщения.")
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.exception("Ошибка создания из MAX: %s", e)
         await reply_fn("❌ Не удалось отправить. Проверьте логи.")

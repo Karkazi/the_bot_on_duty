@@ -5,6 +5,8 @@ from datetime import datetime
 from typing import Optional
 from pydantic import BaseModel, Field, field_validator
 
+from utils.bot_time import bot_now_naive
+
 
 class AlarmCreateRequest(BaseModel):
     """Модель для создания аварии"""
@@ -19,7 +21,7 @@ class AlarmCreateRequest(BaseModel):
     @classmethod
     def validate_fix_time(cls, v: datetime) -> datetime:
         """Проверяет, что время исправления не в прошлом"""
-        if v < datetime.now():
+        if v < bot_now_naive():
             raise ValueError("Время исправления не может быть в прошлом")
         return v
 

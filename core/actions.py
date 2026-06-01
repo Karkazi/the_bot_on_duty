@@ -1,4 +1,4 @@
-# core/actions.py — остановка и продление событий (канал-агностично)
+# core/actions.py — остановка и продление событий (MAX)
 
 import asyncio
 import logging
@@ -6,12 +6,14 @@ from datetime import datetime, timedelta
 from typing import Callable, Awaitable, Any, Optional
 
 from bot_state import bot_state
-from config import CONFIG
-from utils.channel_helpers import send_to_alarm_channels
-from handlers.manage.scm import handle_scm_alarm_close
+from config import CONFIG, jira_browse_url
+from utils.channel_helpers import send_to_alarm_channel
 from services.simpleone_service import SimpleOneService
 from services.max_archive import process_max_chat_on_alarm_close
 from services.max_service import MaxService
+from services.alarm_history_service import append_alarm_closed
+from utils.jira_close_fa import resolve_jira_key, set_time_end_problem
+from utils.bot_time import bot_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -20,13 +22,8 @@ ReplyFn = Callable[[str], Awaitable[Any]]
 
 async def stop_alarm(
     alarm_id: str,
-    telegram_bot: Any,
     reply_fn: ReplyFn,
 ) -> bool:
-    """
-    Останавливает сбой. Все операции (MAX→JIRA, SCM, Петлокал, каналы) выполняются параллельно.
-    Ошибка одного сервиса не блокирует остальные; сбой всегда помечается как остановленный.
-    """
     alarm_info = bot_state.active_alarms.get(alarm_id)
     if not alarm_info:
         await reply_fn("❌ Сбой не найден.")
@@ -40,10 +37,9 @@ async def stop_alarm(
         chat_ids = (CONFIG.get("MAX") or {}).get("ALARM_FA_CHAT_IDS") or []
         if chat_ids:
             max_chat_id = str(chat_ids[0]).strip() or None
-        if max_chat_id:
-            logger.info("Сбой %s без max_chat_id — используем первый чат из ALARM_FA_CHAT_IDS", alarm_id)
-    jira_key = alarm_info.get("jira_key")
+    jira_key = resolve_jira_key(alarm_id, alarm_info)
     failed: list[str] = []
+    closed_at_dt = bot_now_naive()
 
     async def _task_max_archive() -> None:
         if not max_chat_id:
@@ -56,22 +52,17 @@ async def stop_alarm(
             ok = await process_max_chat_on_alarm_close(alarm_id, max_chat_id, jira_key=jira_key)
             if jira_key and not ok:
                 failed.append("архив MAX→JIRA")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning("Ошибка архивации чата MAX для сбоя %s: %s", alarm_id, e, exc_info=True)
+            logger.warning("Архив MAX для %s: %s", alarm_id, e, exc_info=True)
             failed.append("архив MAX→JIRA")
-
-    async def _task_scm() -> None:
-        try:
-            await handle_scm_alarm_close(telegram_bot, alarm_id, alarm_copy)
-        except Exception as e:
-            logger.warning("Ошибка SCM при закрытии сбоя %s: %s", alarm_id, e, exc_info=True)
-            failed.append("SCM (Telegram)")
 
     async def _task_petlocal() -> None:
         if not alarm_copy.get("publish_petlocal", True):
             return
         try:
-            closed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+            closed_at = closed_at_dt.strftime("%d.%m.%Y %H:%M")
             async with SimpleOneService() as simpleone:
                 html = simpleone.format_alarm_closed_for_petlocal(
                     alarm_id=alarm_id,
@@ -79,44 +70,49 @@ async def stop_alarm(
                     closed_at=closed_at,
                 )
                 result = await simpleone.create_portal_post(html)
-                if result.get("success"):
-                    logger.info("Пост о закрытии сбоя %s опубликован на Петлокале", alarm_id)
-                else:
+                if not result.get("success"):
                     failed.append("Петлокал")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning("Ошибка Петлокал при закрытии сбоя %s: %s", alarm_id, e, exc_info=True)
+            logger.warning("Петлокал %s: %s", alarm_id, e, exc_info=True)
             failed.append("Петлокал")
 
     async def _task_channels() -> None:
         text = f"✅ Сбой устранён\n• Проблема: {alarm_copy['issue']}"
+        if not await send_to_alarm_channel(text):
+            failed.append("канал MAX")
+
+    async def _task_jira_time_end() -> None:
+        if not jira_key:
+            return
         try:
-            ok = await send_to_alarm_channels(telegram_bot, text)
+            ok = await set_time_end_problem(jira_key, closed_at_dt)
             if not ok:
-                failed.append("каналы ТГ/MAX")
+                failed.append("Jira TimeEndProblem")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning("Ошибка отправки в каналы при закрытии сбоя %s: %s", alarm_id, e, exc_info=True)
-            failed.append("каналы ТГ/MAX")
+            logger.warning("JIRA TimeEndProblem %s: %s", jira_key, e, exc_info=True)
+            failed.append("Jira TimeEndProblem")
 
-    await asyncio.gather(_task_max_archive(), _task_scm(), _task_petlocal(), _task_channels())
+    await asyncio.gather(_task_max_archive(), _task_petlocal(), _task_channels(), _task_jira_time_end())
 
+    append_alarm_closed(alarm_id=alarm_id, alarm_info=alarm_copy, closed_at=closed_at_dt)
     del bot_state.active_alarms[alarm_id]
     await bot_state.save_state()
 
     msg = f"🚨 Сбой {alarm_id} остановлен."
     if failed:
-        msg += f"\n⚠️ Частичные сбои: {', '.join(failed)}. Проверьте логи."
+        msg += f"\n⚠️ Частичные сбои: {', '.join(failed)}."
     await reply_fn(msg)
     return True
 
 
 async def stop_maintenance(
     work_id: str,
-    telegram_bot: Any,
     reply_fn: ReplyFn,
 ) -> bool:
-    """
-    Завершает регламентную работу. Петлокал и каналы выполняются параллельно.
-    """
     maint_info = bot_state.active_maintenances.get(work_id)
     if not maint_info:
         await reply_fn("❌ Работа не найдена.")
@@ -129,7 +125,7 @@ async def stop_maintenance(
         if not maint_copy.get("publish_petlocal", True):
             return
         try:
-            closed_at = datetime.now().strftime("%d.%m.%Y %H:%M")
+            closed_at = bot_now_naive().strftime("%d.%m.%Y %H:%M")
             async with SimpleOneService() as simpleone:
                 html = simpleone.format_maintenance_closed_for_petlocal(
                     work_id=work_id,
@@ -137,23 +133,18 @@ async def stop_maintenance(
                     closed_at=closed_at,
                 )
                 result = await simpleone.create_portal_post(html)
-                if result.get("success"):
-                    logger.info("Пост о завершении работы %s опубликован на Петлокале", work_id)
-                else:
+                if not result.get("success"):
                     failed.append("Петлокал")
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning("Ошибка Петлокал при закрытии работы %s: %s", work_id, e, exc_info=True)
             failed.append("Петлокал")
+            logger.warning("Петлокал %s: %s", work_id, e, exc_info=True)
 
     async def _task_channels() -> None:
-        text = f"✅ <b>Работа завершена</b>\n• <b>Описание:</b> {maint_copy['description']}"
-        try:
-            ok = await send_to_alarm_channels(telegram_bot, text)
-            if not ok:
-                failed.append("каналы ТГ/MAX")
-        except Exception as e:
-            logger.warning("Ошибка каналов при закрытии работы %s: %s", work_id, e, exc_info=True)
-            failed.append("каналы ТГ/MAX")
+        text = f"✅ Работа завершена\n• Описание: {maint_copy['description']}"
+        if not await send_to_alarm_channel(text):
+            failed.append("канал MAX")
 
     await asyncio.gather(_task_petlocal(), _task_channels())
 
@@ -162,7 +153,7 @@ async def stop_maintenance(
 
     msg = f"🔧 Работа {work_id} остановлена."
     if failed:
-        msg += f"\n⚠️ Частичные сбои: {', '.join(failed)}. Проверьте логи."
+        msg += f"\n⚠️ Частичные сбои: {', '.join(failed)}."
     await reply_fn(msg)
     return True
 
@@ -182,13 +173,8 @@ def _parse_fix_time(alarm_info: dict, alarm_id: str) -> Optional[datetime]:
 async def extend_alarm(
     alarm_id: str,
     minutes: int,
-    telegram_bot: Any,
     reply_fn: ReplyFn,
 ) -> bool:
-    """
-    Продлевает сбой на указанное количество минут.
-    Returns: True если сбой найден и продлён.
-    """
     alarm = bot_state.active_alarms.get(alarm_id)
     if not alarm:
         await reply_fn("❌ Сбой не найден.")
@@ -201,20 +187,22 @@ async def extend_alarm(
 
     new_end = old_end + timedelta(minutes=minutes)
     alarm["fix_time"] = new_end.isoformat()
-    if "reminder_sent_for" in alarm:
-        del alarm["reminder_sent_for"]
+    alarm.pop("reminder_sent_for", None)
 
     text = (
-        f"🔄 <b>Сбой продлён</b>\n"
-        f"• <b>Проблема:</b> {alarm['issue']}\n"
-        f"• <b>Новое время окончания:</b> {new_end.strftime('%d.%m.%Y %H:%M')}"
+        f"🔄 Сбой продлён\n"
+        f"• Проблема: {alarm['issue']}\n"
+        f"• Новое время окончания: {new_end.strftime('%d.%m.%Y %H:%M')}"
     )
+
     async def _send_channels():
         try:
-            if not await send_to_alarm_channels(telegram_bot, text):
-                logger.error("Не удалось отправить сообщение о продлении сбоя %s", alarm_id)
+            await send_to_alarm_channel(text)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning("Ошибка каналов при продлении сбоя %s: %s", alarm_id, e, exc_info=True)
+            logger.warning("Канал при продлении %s: %s", alarm_id, e)
+
     asyncio.create_task(_send_channels())
     await bot_state.save_state()
     await reply_fn(f"✅ Сбой {alarm_id} продлён до {new_end.strftime('%d.%m.%Y %H:%M')}.")
@@ -236,13 +224,8 @@ def _parse_end_time(work_info: dict) -> Optional[datetime]:
 async def extend_maintenance(
     work_id: str,
     minutes: int,
-    telegram_bot: Any,
     reply_fn: ReplyFn,
 ) -> bool:
-    """
-    Продлевает регламентную работу на указанное количество минут.
-    Returns: True если работа найдена и продлена.
-    """
     maint = bot_state.active_maintenances.get(work_id)
     if not maint:
         await reply_fn("❌ Работа не найдена.")
@@ -257,20 +240,22 @@ async def extend_maintenance(
     maint["end_time"] = new_end.isoformat()
     if "end" in maint:
         maint["end"] = new_end.isoformat()
-    if "reminder_sent_for" in maint:
-        del maint["reminder_sent_for"]
+    maint.pop("reminder_sent_for", None)
 
     text = (
-        f"🔄 <b>Работа продлена</b>\n"
-        f"• <b>Описание:</b> {maint['description']}\n"
-        f"• <b>Новое время окончания:</b> {new_end.strftime('%d.%m.%Y %H:%M')}"
+        f"🔄 Работа продлена\n"
+        f"• Описание: {maint['description']}\n"
+        f"• Новое время окончания: {new_end.strftime('%d.%m.%Y %H:%M')}"
     )
+
     async def _send_channels():
         try:
-            if not await send_to_alarm_channels(telegram_bot, text):
-                logger.error("Не удалось отправить сообщение о продлении работы %s", work_id)
+            await send_to_alarm_channel(text)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
-            logger.warning("Ошибка каналов при продлении работы %s: %s", work_id, e, exc_info=True)
+            logger.warning("Канал при продлении работы %s: %s", work_id, e)
+
     asyncio.create_task(_send_channels())
     await bot_state.save_state()
     await reply_fn(f"✅ Работа {work_id} продлена до {new_end.strftime('%d.%m.%Y %H:%M')}.")

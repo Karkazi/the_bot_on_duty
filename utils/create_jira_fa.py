@@ -151,13 +151,18 @@ async def create_failure_issue(
                         logger.debug(f"Ответ сервера: {error_text}")
                         return None
                     elif response.status == 400:
-                        logger.error("Ошибка в данных задачи. Проверьте правильность заполнения полей")
                         try:
                             error_details = await response.json()
-                            logger.debug(f"Детали ошибки: {json.dumps(error_details, ensure_ascii=False, indent=2)}")
+                            detail_str = json.dumps(
+                                error_details, ensure_ascii=False, indent=2
+                            )
                         except Exception:
-                            error_text = await response.text()
-                            logger.debug(f"Текст ответа: {error_text}")
+                            detail_str = (await response.text()) or ""
+                        logger.error(
+                            "Jira отклонила создание задачи (HTTP 400): неверные или неполные поля. "
+                            "Ответ API:\n%s",
+                            detail_str[:4000] if detail_str else "(пустой ответ)",
+                        )
                         return None
                     else:
                         error_text = await response.text()
@@ -290,7 +295,9 @@ def main():
                 print("Ошибка: Неверный формат даты. Используйте формат YYYY-MM-DD HH:mm")
                 time_start_problem = None
     else:
-        time_start_problem = datetime.now().strftime("%Y-%m-%d %H:%M")
+        from utils.bot_time import bot_now_naive
+
+        time_start_problem = bot_now_naive().strftime("%Y-%m-%d %H:%M")
         print(f"\nУстановлено текущее время: {time_start_problem}")
     
     influence_options = ["Клиенты", "Бизнес-функция", "Сотрудники"]

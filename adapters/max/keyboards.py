@@ -30,10 +30,11 @@ def _pack(rows: List[List[Any]]) -> Optional[List[Any]]:
 
 
 def main_menu() -> Optional[List[Any]]:
-    """Главное меню: Сообщить, Текущие события, Управлять, Помощь."""
+    """Главное меню: Сообщить, Текущие события, Управлять, Календарь."""
     return _pack([
         [_btn("📢 Сообщить", "cmd_report"), _btn("📕 Текущие события", "cmd_events")],
-        [_btn("🛂 Управлять", "cmd_manage"), _btn("ℹ️ Помощь", "cmd_help")],
+        [_btn("🛂 Управлять", "cmd_manage"), _btn("📅 Календарь", "cmd_calendar")],
+        [_btn("📊 Статистика", "cmd_stats")],
     ])
 
 
@@ -51,7 +52,7 @@ def cal_notify_keyboard() -> Optional[List[Any]]:
     """Выбор каналов оповещения для записи в календарь работ."""
     return _pack([
         [_btn("🚫 Не оповещаем", "cal_notify_none"), _btn("🏢 Петлокал", "cal_notify_petlocal")],
-        [_btn("💬 Мессенджеры", "cal_notify_messengers"), _btn("💬🏢 Мессенджеры+Петлокал", "cal_notify_both")],
+        [_btn("💬 МАХ", "cal_notify_messengers"), _btn("💬🏢 МАХ+Петлокал", "cal_notify_both")],
         [_btn("◀️ Назад в меню", "cmd_back")],
     ])
 
@@ -72,6 +73,15 @@ def manage_type_menu() -> Optional[List[Any]]:
     ])
 
 
+def stats_period_menu() -> Optional[List[Any]]:
+    """Статистика: выбор периода."""
+    return _pack([
+        [_btn("📅 Сегодня", "stats_today"), _btn("📆 7 дней", "stats_7d")],
+        [_btn("🗓️ 30 дней", "stats_30d"), _btn("✏️ Ввести даты", "stats_custom")],
+        [_btn("◀️ Назад в меню", "cmd_back")],
+    ])
+
+
 def action_menu(item_id: str, item_type: str) -> Optional[List[Any]]:
     """Остановить / Продлить / Назад для выбранного события. item_type: alarm | maintenance."""
     prefix = "a" if item_type == "alarm" else "m"
@@ -82,10 +92,11 @@ def action_menu(item_id: str, item_type: str) -> Optional[List[Any]]:
 
 
 def extend_duration_menu(item_id: str, item_type: str) -> Optional[List[Any]]:
-    """Продление: 30 мин, 1 час, Назад."""
+    """Продление: 30 мин, 1 час, другое время, Назад."""
     prefix = "a" if item_type == "alarm" else "m"
     return _pack([
         [_btn("➕ 30 мин", f"extend_30_{prefix}_{item_id}"), _btn("➕ 1 час", f"extend_60_{prefix}_{item_id}")],
+        [_btn("🕒 Другое время", f"extend_custom_{prefix}_{item_id}")],
         [_btn("◀️ Назад", "manage_back")],
     ])
 
@@ -134,12 +145,12 @@ def regular_photo_skip_keyboard() -> Optional[List[Any]]:
     ])
 
 
-# MAX API ограничивает число рядов клавиатуры (errors.maxRows) — размещаем по несколько кнопок в ряд
-SERVICES_BUTTONS_PER_ROW = 4
+# Делаем сетку сервисов в 2 колонки для лучшей читаемости
+SERVICES_BUTTONS_PER_ROW = 2
 
 
 def service_keyboard() -> Optional[List[Any]]:
-    """Клавиатура выбора затронутого сервиса (по несколько кнопок в ряд из-за лимита maxRows в MAX)."""
+    """Клавиатура выбора затронутого сервиса (2 колонки)."""
     services = _get_services()
     if not services:
         return back_only()
@@ -212,6 +223,40 @@ def confluence_notify_attachment_tokens(work_id: str) -> list:
                     [
                         {"type": "callback", "text": "✅ Информировать", "payload": f"conf_notify_{work_id}"},
                         {"type": "callback", "text": "❌ Не информировать", "payload": f"conf_skip_{work_id}"},
+                    ],
+                ],
+            },
+        },
+    ]
+
+
+def reminder_alarm_attachment_tokens() -> list:
+    """Напоминание за 5 минут до конца сбоя (REST /messages?user_id=)."""
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "✅ Да, продлеваем", "payload": "reminder_extend"},
+                        {"type": "callback", "text": "❌ Нет, останавливаем", "payload": "reminder_stop"},
+                    ],
+                ],
+            },
+        },
+    ]
+
+
+def reminder_maintenance_attachment_tokens() -> list:
+    """Напоминание за 5 минут до конца работ (REST)."""
+    return [
+        {
+            "type": "inline_keyboard",
+            "payload": {
+                "buttons": [
+                    [
+                        {"type": "callback", "text": "⏳ Продлить", "payload": "reminder_extend_maintenance"},
+                        {"type": "callback", "text": "✅ Завершить", "payload": "reminder_stop_maintenance"},
                     ],
                 ],
             },

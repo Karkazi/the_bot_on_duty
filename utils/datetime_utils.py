@@ -9,6 +9,7 @@ import re
 import logging
 
 from domain.constants import DATETIME_FORMAT
+from utils.bot_time import bot_now_naive
 
 logger = logging.getLogger(__name__)
 
@@ -95,7 +96,7 @@ def parse_flexible_datetime(
     if not text or not text.strip():
         return None
     text = text.strip().lower()
-    base = base_time or datetime.now()
+    base = base_time or bot_now_naive()
 
     # 1) Строгий формат дд.мм.гггг чч:мм
     try:

@@ -1,22 +1,17 @@
 """
-Настройка логирования
+Настройка логирования (альтернативный модуль; основной вход — main.setup_logging).
 """
 import logging
-import os
-from datetime import datetime
+
+from utils.app_paths import BOT_LOG_FILE
 
 def setup_logging():
     """Настраивает логирование для приложения"""
     # Формат логов
     log_format = "%(asctime)s | %(name)s | %(levelname)s | %(message)s"
-    
-    # Создаем директорию для логов, если её нет
-    log_dir = "logs"
-    if not os.path.exists(log_dir):
-        os.makedirs(log_dir)
-    
-    # Имя файла лога с датой
-    log_file = os.path.join(log_dir, f"bot_{datetime.now().strftime('%Y%m%d')}.log")
+
+    # Единый файл логов в каталоге проекта (как в main.py)
+    log_file = str(BOT_LOG_FILE)
     
     # Логирование в файл
     file_handler = logging.FileHandler(log_file, encoding="utf-8")

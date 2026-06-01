@@ -1,4 +1,0 @@
-"""
-Middleware для aiogram бота.
-"""
-

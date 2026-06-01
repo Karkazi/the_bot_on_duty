@@ -9,6 +9,8 @@ from typing import Optional, Tuple, Dict, Any
 from dataclasses import dataclass, field
 from enum import Enum
 
+from utils.bot_time import bot_now_naive
+
 logger = logging.getLogger(__name__)
 
 
@@ -128,13 +130,13 @@ class ReminderPriorityQueue:
         Получает все напоминания, которые должны быть отправлены сейчас.
         
         Args:
-            now: Текущее время (по умолчанию datetime.now())
+            now: Текущее время (по умолчанию bot_now_naive / BOT_TIMEZONE)
         
         Returns:
             Список элементов напоминаний, которые нужно отправить
         """
         if now is None:
-            now = datetime.now()
+            now = bot_now_naive()
         
         async with self._lock:
             due_items = []

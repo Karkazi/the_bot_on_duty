@@ -3,6 +3,7 @@
 Централизованные константы для всего бота.
 Убирает магические строки и числа из кода.
 """
+from typing import Optional
 
 # Форматы даты и времени
 DATETIME_FORMAT = "%d.%m.%Y %H:%M"
@@ -39,6 +40,22 @@ PROBLEM_LEVEL_ISSUES = "Проблемы в работе сервиса"
 INFLUENCE_CLIENTS = "Клиенты"
 INFLUENCE_BUSINESS = "Бизнес-функция"
 INFLUENCE_EMPLOYEES = "Сотрудники"
+
+# Сбой: пункт «Другое» в списке сервисов (совпадает с config.PROBLEM_SERVICES)
+PROBLEM_SERVICE_OTHER = "Другое"
+MAX_SERVICE_OTHER_SPEC_LENGTH = 500
+
+
+def format_alarm_service_for_display(service: Optional[str], service_other_spec: Optional[str] = None) -> str:
+    """
+    Строка сервиса для каналов, Петлокала и единого HTML.
+    При выборе «Другое» подставляется уточнение от администратора.
+    """
+    s = (service or "").strip()
+    spec = (service_other_spec or "").strip()
+    if s == PROBLEM_SERVICE_OTHER and spec:
+        return f"{s}: {spec}"
+    return s or "не указан"
 
 # Напоминания
 REMINDER_MINUTES_BEFORE = 5
@@ -125,9 +142,11 @@ MAINTENANCE_TIME_STEPS_ORDER = [
 
 def _format_date_offset(days_offset: int, now=None) -> str:
     """Форматирует смещение дней в читаемую дату"""
-    from datetime import datetime, timedelta
+    from datetime import timedelta
+    from utils.bot_time import bot_now_naive
+
     if now is None:
-        now = datetime.now()
+        now = bot_now_naive()
     target_date = now + timedelta(days=days_offset)
     months = [
         "января", "февраля", "марта", "апреля", "мая", "июня",

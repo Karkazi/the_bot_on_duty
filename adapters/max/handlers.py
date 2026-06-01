@@ -2,9 +2,11 @@
 
 import re
 import logging
+import asyncio
 from typing import TYPE_CHECKING, Optional
 
 from config import CONFIG, is_max_admin
+from utils.bot_time import bot_now_naive
 from core import get_help_text, get_active_events_text, stop_alarm, stop_maintenance, extend_alarm, extend_maintenance
 from adapters.max.sessions import (
     get_session,
@@ -16,8 +18,7 @@ from adapters.max.sessions import (
     clear_manage_session,
     get_last_bot_message_id,
     set_last_bot_message_id,
-    clear_last_bot_message_id,
-)
+    clear_last_bot_message_id)
 from adapters.max.create_flow import handle_create_message, _execute_confirmation
 from adapters.max.keyboards import (
     main_menu,
@@ -31,13 +32,13 @@ from adapters.max.keyboards import (
     maintenance_list_keyboard,
     service_keyboard,
     jira_option_keyboard,
-    scm_option_keyboard,
     petlocal_option_keyboard,
     confirmation_keyboard,
     regular_photo_skip_keyboard,
     maintenance_time_method_keyboard,
     create_time_spinner_keyboard_max,
     cal_notify_keyboard,
+    stats_period_menu,
 )
 
 if TYPE_CHECKING:
@@ -45,13 +46,38 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-# Telegram bot instance для send_to_alarm_channels и SCM (подставляется при запуске polling)
-_telegram_bot = None
+# Callback payload'ы напоминаний «за 5 минут» — доступны автору события, не только MAX-админам.
+_MAX_REMINDER_CALLBACK_PAYLOADS = frozenset({
+    "reminder_extend",
+    "reminder_stop",
+    "reminder_extend_maintenance",
+    "reminder_stop_maintenance",
+})
 
 
-def set_telegram_bot(bot):
-    global _telegram_bot
-    _telegram_bot = bot
+def _parse_stats_date_range(text: str):
+    """
+    Диапазон дат в виде:
+    - ДД.ММ.ГГГГ-ДД.ММ.ГГГГ
+    - ДД.ММ.ГГГГ — ДД.ММ.ГГГГ
+    """
+    s = (text or "").strip()
+    if not s:
+        return None
+    s = s.replace("—", "-").replace("–", "-")
+    parts = [p.strip() for p in s.split("-") if p.strip()]
+    if len(parts) != 2:
+        return None
+    from datetime import datetime as _dt
+
+    try:
+        start = _dt.strptime(parts[0], "%d.%m.%Y").date()
+        end = _dt.strptime(parts[1], "%d.%m.%Y").date()
+        if end < start:
+            start, end = end, start
+        return start, end
+    except Exception:
+        return None
 
 
 def _user_id(event: "MessageCreated"):
@@ -181,6 +207,8 @@ async def _reply(event, text: str, attachments=None):
             if sent and getattr(sent, "message", None) and getattr(sent.message, "body", None):
                 return getattr(sent.message.body, "mid", None)
             return None
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning("Ответ в MAX через event.message.answer не удался: %s", e)
     # Fallback: отправить через MaxService (без клавиатуры, без message_id)
@@ -191,6 +219,8 @@ async def _reply(event, text: str, attachments=None):
             svc = MaxService()
             if svc.is_configured():
                 await svc.send_message(chat_id, text, strip_html=True)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("Ответ в MAX через MaxService не удался: %s", e)
     return None
@@ -206,8 +236,6 @@ def _resolve_attachments(attachments) -> Optional[list]:
         return service_keyboard()
     if attachments == "jira_keyboard":
         return jira_option_keyboard()
-    if attachments == "scm_keyboard":
-        return scm_option_keyboard()
     if attachments == "petlocal_keyboard":
         return petlocal_option_keyboard()
     if attachments == "confirmation_keyboard":
@@ -230,6 +258,8 @@ async def _reply_and_track(event, user_id: int, text: str, attachments=None):
         try:
             bot = event.message._ensure_bot()
             await bot.delete_message(last_mid)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug("MAX: не удалось удалить предыдущее сообщение бота: %s", e)
         clear_last_bot_message_id(user_id)
@@ -247,8 +277,65 @@ async def _reply_max_callback(event, user_id: int, text: str, attachments=None) 
             mid = getattr(sent.message.body, "mid", None)
             if mid:
                 set_last_bot_message_id(user_id, mid)
+    except asyncio.CancelledError:
+        raise
     except Exception as e:
         logger.warning("MAX callback reply не удался: %s", e)
+
+
+async def _handle_max_reminder_callback(event, uid: int, payload: str) -> None:
+    """Кнопки напоминания за 5 минут до конца сбоя/работы (аналог Telegram handlers/manage/reminders)."""
+    from bot_state import bot_state
+
+    user_state = bot_state.user_states.get(uid)
+
+    if payload in ("reminder_extend", "reminder_stop"):
+        if not user_state or user_state.get("type") != "reminder":
+            await _reply_max_callback(event, uid, "❌ Это уведомление устарело.", main_menu())
+            return
+        alarm_id = user_state["alarm_id"]
+        alarm = bot_state.active_alarms.get(alarm_id)
+        if not alarm:
+            await _reply_max_callback(event, uid, "❌ Сбой уже устранён.", main_menu())
+            bot_state.user_states.pop(uid, None)
+            return
+        if payload == "reminder_stop":
+            async def reply_fn(t: str):
+                await _reply_max_callback(event, uid, t, main_menu())
+            ok = await stop_alarm(alarm_id, reply_fn)
+            if ok:
+                bot_state.user_states.pop(uid, None)
+            return
+        set_manage_session(uid, "extend", item_id=alarm_id, item_type="alarm")
+        bot_state.user_states.pop(uid, None)
+        await _reply_max_callback(
+            event, uid, f"⏳ На сколько продлить сбой {alarm_id}?", extend_duration_menu(alarm_id, "alarm")
+        )
+        return
+
+    # maintenance
+    if not user_state or user_state.get("type") != "maintenance_reminder":
+        await _reply_max_callback(event, uid, "❌ Это уведомление устарело.", main_menu())
+        return
+    work_id = user_state["work_id"]
+    work = bot_state.active_maintenances.get(work_id)
+    if not work:
+        await _reply_max_callback(event, uid, "❌ Работа уже завершена.", main_menu())
+        bot_state.user_states.pop(uid, None)
+        return
+    if payload == "reminder_stop_maintenance":
+        async def reply_fn_m(t: str):
+            await _reply_max_callback(event, uid, t, main_menu())
+        ok = await stop_maintenance(work_id, reply_fn_m)
+        if ok:
+            bot_state.user_states.pop(uid, None)
+        return
+    if payload == "reminder_extend_maintenance":
+        set_manage_session(uid, "extend", item_id=work_id, item_type="maintenance")
+        bot_state.user_states.pop(uid, None)
+        await _reply_max_callback(
+            event, uid, f"⏳ На сколько продлить работу {work_id}?", extend_duration_menu(work_id, "maintenance")
+        )
 
 
 def _spinner_progress_bar_max(current_step: int, total_steps: int) -> str:
@@ -263,7 +350,6 @@ def _get_spinner_message_and_attachments_max(uid: int):
     Текст и вложения для текущего шага спиннера по сессии.
     Возвращает (text, attachments) или (None, None) если шаг финальный (нужна финализация).
     """
-    from datetime import datetime
     from domain.constants import MAINTENANCE_TIME_SPINNER_CONFIG, MAINTENANCE_TIME_STEPS_ORDER
 
     sess = get_session(uid)
@@ -282,7 +368,7 @@ def _get_spinner_message_and_attachments_max(uid: int):
     total = len(MAINTENANCE_TIME_STEPS_ORDER)
     progress = _spinner_progress_bar_max(step_index + 1, total)
     if field_type in ("date", "date_end"):
-        value_display = config["format"](current_value, datetime.now())
+        value_display = config["format"](current_value, bot_now_naive())
     else:
         value_display = config["format"](current_value)
     text = (
@@ -297,7 +383,6 @@ def _get_spinner_message_and_attachments_max(uid: int):
 
 async def _finalize_max_spinner(event, uid: int) -> None:
     """Завершить выбор времени: записать start_time/end_time, перейти к enter_unavailable_services."""
-    from datetime import datetime as dt
     from domain.constants import MAINTENANCE_TIME_STEPS_ORDER
     from utils.maintenance_time_utils import MaintenanceTimeSpinner
 
@@ -311,7 +396,7 @@ async def _finalize_max_spinner(event, uid: int) -> None:
     minute_end = spinner_data.get("minute_end", 0)
     start_time = MaintenanceTimeSpinner.build_datetime(date_offset, hour_start, minute_start)
     end_time = MaintenanceTimeSpinner.build_datetime(date_end_offset, hour_end, minute_end)
-    now = dt.now()
+    now = bot_now_naive()
     if start_time < now:
         spinner_data["current_step_index"] = 0
         update_session_data(uid, maintenance_spinner=spinner_data)
@@ -356,8 +441,7 @@ async def _handle_max_spinner_callback(event, uid: int, payload: str) -> None:
         set_session(uid, "enter_start_time")
         await event.message.edit(
             text="🚫 Выбор времени отменён. Введите дату текстом или нажмите Спиннеры снова.",
-            attachments=maintenance_time_method_keyboard(),
-        )
+            attachments=maintenance_time_method_keyboard())
         return
 
     if payload == "spinner_prev":
@@ -366,8 +450,7 @@ async def _handle_max_spinner_callback(event, uid: int, payload: str) -> None:
             set_session(uid, "enter_start_time")
             await event.message.edit(
                 text="🚫 Выбор отменён. Введите дату или нажмите Спиннеры.",
-                attachments=maintenance_time_method_keyboard(),
-            )
+                attachments=maintenance_time_method_keyboard())
             return
         spinner_data["current_step_index"] = step_index - 1
         update_session_data(uid, maintenance_spinner=spinner_data)
@@ -446,7 +529,7 @@ async def _execute_cal_work(event, uid: int) -> None:
     try:
         start_dt = _dt.fromisoformat(start_time_raw)
         end_dt = _dt.fromisoformat(end_time_raw)
-    except Exception:
+    except ValueError:
         await _reply_max_callback(event, uid, "❌ Ошибка разбора времени.", main_menu())
         return
 
@@ -492,15 +575,14 @@ async def _execute_cal_work(event, uid: int) -> None:
     }
     await bot_state.save_state()
 
-    from handlers.manage.confluence_calendar import notify_admins_about_work
+    from services.confluence_calendar_worker import notify_admins_about_work
     await notify_admins_about_work(row)
 
     await _reply_max_callback(
         event, uid,
         f"✅ Работа добавлена в Confluence (ID: {work_id[:8]}).\n"
         f"Уведомления отправлены администраторам календаря.",
-        main_menu(),
-    )
+        main_menu())
 
 
 def _register_handlers(dp):
@@ -532,6 +614,8 @@ def _register_handlers(dp):
             await ev.message.delete()
             logger.debug("ALARM_MAIN: удалено сообщение от user_id=%s", sender_id)
             return True
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("ALARM_MAIN: не удалось удалить сообщение: %s", e)
             return False
@@ -556,7 +640,7 @@ def _register_handlers(dp):
             return
         welcome = (
             "👋 Привет! Я бот для управления событиями и уведомлениями.\n\n"
-            "Выберите действие кнопкой ниже или напишите команду (/help — справка)."
+            "Выберите действие кнопкой ниже. Справка: /help"
         )
         await _reply(event, welcome, attachments=main_menu())
 
@@ -590,21 +674,31 @@ def _register_handlers(dp):
         if uid is None:
             try:
                 await event.message.answer("Не удалось определить пользователя.")
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning("MAX callback: не удалось отправить ответ (user unknown): %s", e)
             return
         calendar_admin_ids = CONFIG.get("MAX", {}).get("CALENDAR_ADMIN_IDS") or []
-        allowed = is_max_admin(uid) or (payload.startswith("conf_") and uid in calendar_admin_ids)
+        allowed = (
+            is_max_admin(uid)
+            or (payload.startswith("conf_") and uid in calendar_admin_ids)
+            or payload in _MAX_REMINDER_CALLBACK_PAYLOADS
+        )
         if not allowed:
             try:
                 await event.message.answer(
                     "❌ У вас нет прав для управления ботом из MAX. Обратитесь к администратору."
                 )
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.warning("MAX callback: не удалось отправить ответ (no admin): %s", e)
             return
         try:
             await event.answer(notification=None)
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX callback: не удалось вызвать event.answer: %s", e)
 
@@ -616,8 +710,14 @@ def _register_handlers(dp):
         # Удаляем сообщение бота с кнопкой — в чате остаётся только следующий ответ
         try:
             await event.message.delete()
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.debug("MAX: не удалось удалить сообщение с кнопкой: %s", e)
+
+        if payload in _MAX_REMINDER_CALLBACK_PAYLOADS:
+            await _handle_max_reminder_callback(event, uid, payload)
+            return
 
         # Старт спиннеров времени (после "Спиннеры" на шаге enter_start_time)
         if payload == "maint_time_spinners":
@@ -643,6 +743,8 @@ def _register_handlers(dp):
                             mid = getattr(sent.message.body, "mid", None)
                             if mid:
                                 set_last_bot_message_id(uid, mid)
+                    except asyncio.CancelledError:
+                        raise
                     except Exception as e:
                         logger.warning("MAX spinner start: %s", e)
                 return
@@ -654,8 +756,7 @@ def _register_handlers(dp):
                     event, uid,
                     "⏰ Введите дату и время начала:\n"
                     "02.02.2026 14:00 или через 1 час, завтра 10:00",
-                    back_only(),
-                )
+                    back_only())
                 return
 
         # Назад в меню — сброс сессий и главное меню
@@ -669,10 +770,57 @@ def _register_handlers(dp):
             await _reply_max_callback(event, uid, get_help_text(html=False), main_menu())
             return
 
+        if payload == "cmd_stats":
+            if not is_max_admin(uid):
+                await _reply_max_callback(event, uid, "❌ Команда доступна только админам.", main_menu())
+                return
+            clear_session(uid)
+            set_manage_session(uid, "stats_period")
+            await _reply_max_callback(event, uid, "📊 Выберите период:", stats_period_menu())
+            return
+
+        if payload == "cmd_calendar":
+            from services.calendar_digest_service import get_today_calendar_digest_text
+            text = await get_today_calendar_digest_text()
+            await _reply_max_callback(event, uid, text, main_menu())
+            return
+
         if payload == "cmd_events":
             alarms_text, _ = get_active_events_text("alarms", 0, html=False)
             works_text, _ = get_active_events_text("maintenances", 0, html=False)
             await _reply_max_callback(event, uid, alarms_text + "\n\n" + works_text, event_list_menu())
+            return
+
+        # Статистика: быстрые периоды / кастом
+        if payload in ("stats_today", "stats_7d", "stats_30d", "stats_custom"):
+            if not is_max_admin(uid):
+                await _reply_max_callback(event, uid, "❌ Команда доступна только админам.", main_menu())
+                return
+            if payload == "stats_custom":
+                set_manage_session(uid, "stats_custom_wait")
+                await _reply_max_callback(
+                    event,
+                    uid,
+                    "✏️ Введите диапазон дат: ДД.ММ.ГГГГ-ДД.ММ.ГГГГ",
+                    main_menu(),
+                )
+                return
+
+            from datetime import timedelta as _td
+            from services.alarm_history_service import build_alarm_stats_report
+
+            today = bot_now_naive().date()
+            if payload == "stats_today":
+                start = end = today
+            elif payload == "stats_7d":
+                start = today - _td(days=6)
+                end = today
+            else:
+                start = today - _td(days=29)
+                end = today
+            report = build_alarm_stats_report(start=start, end=end)
+            clear_manage_session(uid)
+            await _reply_max_callback(event, uid, report, main_menu())
             return
 
         if payload == "events_alarms":
@@ -720,7 +868,7 @@ def _register_handlers(dp):
         if payload.startswith("conf_notify_"):
             work_id = payload.replace("conf_notify_", "", 1)
             entry = bot_state.known_maintenances_from_confluence.get(work_id)
-            if entry is None or entry.get("status") not in ("pending_decision",):
+            if entry is None or entry.get("status") not in ("pending_decision"):
                 await _reply_max_callback(event, uid, "Запрос устарел или уже обработан.", main_menu())
                 return
             try:
@@ -732,43 +880,31 @@ def _register_handlers(dp):
                     return
                 # Не трогаем работы, где окончание уже прошло
                 from datetime import datetime as _dt
-                if end_time <= _dt.now():
+                if end_time <= bot_now_naive():
                     entry["status"] = "expired"
                     await bot_state.save_state()
                     await _reply_max_callback(event, uid, "Работы уже завершились — оповещение не отправляем.", main_menu())
                     return
-                # Оповещения: ТГ — только ТГ+MAX; Петлокал — только Петлокал; ТГ+Петлокал/Петлокал+ТГ — оба
-                notify = (entry.get("notify") or "").lower()
-                has_tg = "тг" in notify
-                has_petlocal = "петлокал" in notify or "petlocal" in notify
-                send_to_telegram_max = has_tg
-                publish_petlocal = has_petlocal
-                if not send_to_telegram_max and not publish_petlocal:
-                    await _reply_max_callback(event, uid, "В Оповещениях не указаны каналы (ТГ или Петлокал).", main_menu())
-                    return
+                # Решение встречи: при «Информировать» из календаря — всегда MAX + Петлокал
                 data = {
                     "description": entry.get("description", "не указано"),
                     "start_time": start_time.isoformat() if hasattr(start_time, "isoformat") else start_time,
                     "end_time": end_time.isoformat() if hasattr(end_time, "isoformat") else end_time,
                     "unavailable_services": entry.get("unavailable_services", "не указано"),
-                    "send_to_telegram_max": send_to_telegram_max,
-                    "publish_petlocal": publish_petlocal,
+                    "send_to_max": True,
+                    "publish_petlocal": True,
                 }
                 async def _reply_fn(t: str, attachments=None):
                     await _reply_max_callback(event, uid, t, attachments or main_menu())
-                ok = await create_maintenance(data, _telegram_bot, _reply_fn, uid)
+                ok = await create_maintenance(data, _reply_fn, uid, author_messenger="max")
                 if ok:
                     entry["status"] = "notified"
                     await bot_state.save_state()
-                    parts = []
-                    if send_to_telegram_max:
-                        parts.append("ТГ, MAX")
-                    if publish_petlocal:
-                        parts.append("Петлокал")
-                    ch = ", ".join(parts)
-                    await _reply_max_callback(event, uid, "Оповещения отправлены: " + ch, main_menu())
+                    await _reply_max_callback(event, uid, "Оповещения отправлены: MAX, Петлокал", main_menu())
                 else:
                     await _reply_max_callback(event, uid, "Не удалось оповестить. См. логи.", main_menu())
+            except asyncio.CancelledError:
+                raise
             except Exception as e:
                 logger.exception("CONF_MAINT conf_notify: %s", e)
                 await _reply_max_callback(event, uid, "Ошибка при отправке оповещений. См. логи.", main_menu())
@@ -783,8 +919,8 @@ def _register_handlers(dp):
             notify_map = {
                 "cal_notify_none": "Нет",
                 "cal_notify_petlocal": "Петлокал",
-                "cal_notify_messengers": "ТГ",
-                "cal_notify_both": "ТГ+Петлокал",
+                "cal_notify_messengers": "МАХ",
+                "cal_notify_both": "Петлокал+МАХ",
             }
             cal_notify = notify_map[payload]
             update_session_data(uid, cal_notify=cal_notify)
@@ -794,7 +930,7 @@ def _register_handlers(dp):
             def _fmt(iso: str) -> str:
                 try:
                     return _dt.fromisoformat(iso).strftime("%d.%m.%Y %H:%M")
-                except Exception:
+                except ValueError:
                     return iso
             summary = (
                 f"📅 Проверьте данные перед добавлением в календарь:\n\n"
@@ -845,22 +981,16 @@ def _register_handlers(dp):
 
         if payload.startswith("action_stop_a_"):
             item_id = payload.replace("action_stop_a_", "", 1)
-            if not _telegram_bot:
-                await _reply_max_callback(event, uid, "❌ Сервис недоступен.", main_menu())
-                return
             async def reply_fn(t: str):
                 await _reply_max_callback(event, uid, t, main_menu())
-            await stop_alarm(item_id, _telegram_bot, reply_fn)
+            await stop_alarm(item_id, reply_fn)
             clear_manage_session(uid)
             return
         if payload.startswith("action_stop_m_"):
             item_id = payload.replace("action_stop_m_", "", 1)
-            if not _telegram_bot:
-                await _reply_max_callback(event, uid, "❌ Сервис недоступен.", main_menu())
-                return
             async def reply_fn(t: str):
                 await _reply_max_callback(event, uid, t, main_menu())
-            await stop_maintenance(item_id, _telegram_bot, reply_fn)
+            await stop_maintenance(item_id, reply_fn)
             clear_manage_session(uid)
             return
 
@@ -877,43 +1007,51 @@ def _register_handlers(dp):
 
         if payload.startswith("extend_30_a_"):
             item_id = payload.replace("extend_30_a_", "", 1)
-            if not _telegram_bot:
-                await _reply_max_callback(event, uid, "❌ Сервис недоступен.", main_menu())
-                return
             async def reply_fn(t: str):
                 await _reply_max_callback(event, uid, t, main_menu())
-            await extend_alarm(item_id, 30, _telegram_bot, reply_fn)
+            await extend_alarm(item_id, 30, reply_fn)
             clear_manage_session(uid)
             return
         if payload.startswith("extend_60_a_"):
             item_id = payload.replace("extend_60_a_", "", 1)
-            if not _telegram_bot:
-                await _reply_max_callback(event, uid, "❌ Сервис недоступен.", main_menu())
-                return
             async def reply_fn(t: str):
                 await _reply_max_callback(event, uid, t, main_menu())
-            await extend_alarm(item_id, 60, _telegram_bot, reply_fn)
+            await extend_alarm(item_id, 60, reply_fn)
             clear_manage_session(uid)
             return
         if payload.startswith("extend_30_m_"):
             item_id = payload.replace("extend_30_m_", "", 1)
-            if not _telegram_bot:
-                await _reply_max_callback(event, uid, "❌ Сервис недоступен.", main_menu())
-                return
             async def reply_fn(t: str):
                 await _reply_max_callback(event, uid, t, main_menu())
-            await extend_maintenance(item_id, 30, _telegram_bot, reply_fn)
+            await extend_maintenance(item_id, 30, reply_fn)
             clear_manage_session(uid)
             return
         if payload.startswith("extend_60_m_"):
             item_id = payload.replace("extend_60_m_", "", 1)
-            if not _telegram_bot:
-                await _reply_max_callback(event, uid, "❌ Сервис недоступен.", main_menu())
-                return
             async def reply_fn(t: str):
                 await _reply_max_callback(event, uid, t, main_menu())
-            await extend_maintenance(item_id, 60, _telegram_bot, reply_fn)
+            await extend_maintenance(item_id, 60, reply_fn)
             clear_manage_session(uid)
+            return
+        if payload.startswith("extend_custom_a_"):
+            item_id = payload.replace("extend_custom_a_", "", 1)
+            set_manage_session(uid, "extend_custom_minutes", item_id=item_id, item_type="alarm")
+            await _reply_max_callback(
+                event,
+                uid,
+                f"🕒 На сколько минут продлить сбой {item_id}?\n"
+                "Введите число от 1 до 10080 (например: 90).",
+                back_only())
+            return
+        if payload.startswith("extend_custom_m_"):
+            item_id = payload.replace("extend_custom_m_", "", 1)
+            set_manage_session(uid, "extend_custom_minutes", item_id=item_id, item_type="maintenance")
+            await _reply_max_callback(
+                event,
+                uid,
+                f"🕒 На сколько минут продлить работу {item_id}?\n"
+                "Введите число от 1 до 10080 (например: 90).",
+                back_only())
             return
 
         # Сообщить: показать выбор типа с клавиатурой
@@ -926,7 +1064,7 @@ def _register_handlers(dp):
             num = "1" if payload == "msg_type_alarm" else "2" if payload == "msg_type_maintenance" else "3"
             async def reply_fn(t: str, attachments=None):
                 await _reply_max_callback(event, uid, t, attachments)
-            await handle_create_message(event, reply_fn, uid, num, telegram_bot=_telegram_bot)
+            await handle_create_message(event, reply_fn, uid, num)
             return
 
         if payload == "msg_type_cal_work":
@@ -955,51 +1093,48 @@ def _register_handlers(dp):
         if payload in ("jira_yes", "jira_no") and get_session(uid):
             sess = get_session(uid)
             if sess.get("step") == "select_jira" and sess.get("data", {}).get("type") == "alarm":
-                from datetime import datetime as dt, timedelta
+                from datetime import timedelta
                 from domain.constants import DATETIME_FORMAT
                 if payload == "jira_yes":
                     update_session_data(uid, create_jira=True)
-                    now = dt.now()
+                    now = bot_now_naive()
                     fix_time = now + timedelta(hours=1)
                     update_session_data(uid, fix_time=fix_time.isoformat())
                     set_session(uid, "select_petlocal")
                     await _reply_max_callback(
                         event, uid,
                         f"✅ Jira будет создана. Исправим до: {fix_time.strftime(DATETIME_FORMAT)}.\n📢 Публиковать на Петлокале?",
+                        petlocal_option_keyboard())
+                else:
+                    from datetime import timedelta
+                    from domain.constants import DATETIME_FORMAT
+                    update_session_data(uid, create_jira=False)
+                    now = bot_now_naive()
+                    fix_time = now + timedelta(hours=1)
+                    update_session_data(uid, fix_time=fix_time.isoformat())
+                    set_session(uid, "select_petlocal")
+                    await _reply_max_callback(
+                        event, uid,
+                        f"Исправим до: {fix_time.strftime(DATETIME_FORMAT)}.\n📢 Публиковать на Петлокале?",
                         petlocal_option_keyboard(),
                     )
-                else:
-                    update_session_data(uid, create_jira=False)
-                    set_session(uid, "select_scm")
-                    await _reply_max_callback(event, uid, "📋 Завести тему в канале SCM?", scm_option_keyboard())
-                return
-
-        # Завести тему в SCM? (при заведении сбоя без Jira)
-        if payload in ("scm_create", "scm_skip") and get_session(uid):
-            sess = get_session(uid)
-            if sess.get("step") == "select_scm" and sess.get("data", {}).get("type") == "alarm":
-                from datetime import datetime as dt, timedelta
-                update_session_data(uid, create_scm=(payload == "scm_create"))
-                now = dt.now()
-                fix_time = now + timedelta(hours=1)
-                update_session_data(uid, fix_time=fix_time.isoformat())
-                set_session(uid, "select_petlocal")
-                from domain.constants import DATETIME_FORMAT
-                await _reply_max_callback(
-                    event, uid,
-                    f"Исправим до: {fix_time.strftime(DATETIME_FORMAT)}.\n📢 Публиковать на Петлокале?",
-                    petlocal_option_keyboard(),
-                )
                 return
 
         # Выбор сервиса при заведении сбоя (инлайн-кнопки)
         if payload.startswith("svc_"):
             from config import PROBLEM_SERVICES
+            from domain.constants import PROBLEM_SERVICE_OTHER
             try:
                 idx = int(payload.replace("svc_", "", 1))
                 if 0 <= idx < len(PROBLEM_SERVICES):
                     service = PROBLEM_SERVICES[idx]
-                    update_session_data(uid, service=service)
+                    update_session_data(uid, service=service, service_other_spec=None)
+                    if service == PROBLEM_SERVICE_OTHER:
+                        set_session(uid, "enter_service_other_spec")
+                        await _reply_max_callback(
+                            event, uid,
+                            "✏️ Уточните, какой это сервис (поле «Другое»). Напишите текст сообщением.")
+                        return
                     set_session(uid, "select_jira")
                     await _reply_max_callback(event, uid, "📋 Создать задачу в Jira?", jira_option_keyboard())
                     return
@@ -1014,181 +1149,24 @@ def _register_handlers(dp):
             if sess.get("step") == "confirmation":
                 async def _confirm_reply(t: str, attachments=None):
                     await _reply_max_callback(event, uid, t, attachments if attachments else main_menu())
-                await _execute_confirmation(uid, _confirm_reply, _telegram_bot)
+                await _execute_confirmation(uid, _confirm_reply)
                 return
 
         try:
             await _reply_max_callback(event, uid, "Неизвестная команда.", main_menu())
+        except asyncio.CancelledError:
+            raise
         except Exception as e:
             logger.warning("MAX: не удалось отправить ответ «Неизвестная команда»: %s", e)
 
-    def _is_fa_chat_for_bridge(ev) -> bool:
-        """True, если сообщение из чата обсуждения сбоя (FA), куда мостим в TG."""
-        from bot_state import bot_state
-        cid = _chat_id(ev)
-        if not cid:
-            return False
-        cid_str = str(cid)
-        for info in bot_state.active_alarms.values():
-            if str(info.get("max_chat_id") or "") == cid_str:
-                return True
-        return False
-
-    # Один обработчик message_created: личный чат -> сценарий (Опишите проблему и т.д.), чат FA -> мост в TG.
-    # Порядок важен: личный чат обрабатываем здесь, чтобы ответ на «Опишите проблему» не забирал мост.
-    # Если ALARM_MAIN и FA — один и тот же чат (один id в .env), не модерируем: сообщения должны идти в мост в TG.
     @dp.message_created()
     async def message_created_router(event: MessageCreated):
-        if _is_alarm_main(event) and not _is_fa_chat_for_bridge(event):
+        if _is_alarm_main(event):
             await _alarm_main_moderate(event)
             return
-        # Личный чат — сценарий «Сообщить», команды, остановить/продлить (text_handlers)
         if _is_direct_chat(event):
             await _handle_direct_chat_message(event)
             return
-        # Чат FA по сбою — мост MAX -> TG
-        if _is_fa_chat_for_bridge(event):
-            await _bridge_max_to_tg_impl(event)
-            return
-        from bot_state import bot_state
-        cid = _chat_id(event)
-        if cid:
-            logger.debug("MAX message_created: чат %s не личный и не FA (max_chat_id сбоёв: %s)", cid, [str(i.get("max_chat_id") or "") for i in bot_state.active_alarms.values()])
-
-    async def _bridge_max_to_tg_impl(event: MessageCreated):
-        from bot_state import bot_state
-        from config import CONFIG
-        cid = _chat_id(event)
-        if not cid or not _telegram_bot:
-            if not _telegram_bot and cid:
-                logger.warning("Мост MAX->TG: telegram_bot не задан, чат %s", cid)
-            return
-        cid_str = str(cid)
-        for alarm_id, info in list(bot_state.active_alarms.items()):
-            if str(info.get("max_chat_id") or "") != cid_str:
-                continue
-            scm_topic_id = info.get("scm_topic_id")
-            scm_channel_id = CONFIG.get("TELEGRAM", {}).get("SCM_CHANNEL_ID")
-            if not scm_topic_id or not scm_channel_id:
-                logger.warning("Мост MAX->TG: сбой %s — нет scm_topic_id(%s) или SCM_CHANNEL_ID(%s)", alarm_id, scm_topic_id, bool(scm_channel_id))
-                return
-            msg = getattr(event, "message", event)
-            sender = getattr(msg, "sender", None) or getattr(event, "from_user", None)
-            sender_id = None
-            if sender is not None:
-                sender_id = getattr(sender, "user_id", None) or getattr(sender, "id", None)
-                if sender_id is not None:
-                    sender_id = int(sender_id)
-            if max_bot_user_id is not None and sender_id is not None and sender_id == max_bot_user_id:
-                return
-            sender_name = "MAX"
-            if sender is not None:
-                full = getattr(sender, "full_name", None)
-                if full and str(full).strip():
-                    sender_name = str(full).strip()
-                else:
-                    first = getattr(sender, "first_name", None)
-                    last = getattr(sender, "last_name", None)
-                    if first or last:
-                        sender_name = " ".join(filter(None, [str(first or "").strip(), str(last or "").strip()])).strip() or sender_name
-                if sender_name == "MAX" and sender_id is not None:
-                    sender_name = f"user_{sender_id}"
-            text = _message_text(event)
-            image_url = _first_image_url(event)
-            message_mid = _message_mid(event)
-            all_attachments = []
-            try:
-                from services.max_media import extract_attachments_from_max_message, download_attachment_max
-                all_attachments = extract_attachments_from_max_message(msg)
-            except Exception as e:
-                logger.debug("Мост MAX->TG: извлечение вложений: %s", e)
-            # В ряде случаев MessageCreated не содержит URL вложений (только token).
-            # Пробуем восстановить вложения через GET /messages.
-            if not image_url and not all_attachments:
-                try:
-                    from services.max_service import MaxService
-                    max_svc = MaxService()
-                    if max_svc.is_configured():
-                        history = await max_svc.get_messages(cid_str, count=20) or []
-                        picked = None
-                        if message_mid:
-                            for m in history:
-                                if str(m.get("mid") or "") == message_mid:
-                                    picked = m
-                                    break
-                        if picked is None and history:
-                            picked = history[0]
-                        if picked:
-                            all_attachments = picked.get("attachments") or []
-                            if not image_url:
-                                for att in all_attachments:
-                                    u = (att.get("url") or "").strip()
-                                    if att.get("type") in ("image", "photo") and u.startswith("http"):
-                                        image_url = u
-                                        break
-                            if all_attachments:
-                                logger.info(
-                                    "Мост MAX->TG: вложения восстановлены через get_messages (mid=%s, count=%s)",
-                                    message_mid,
-                                    len(all_attachments),
-                                )
-                except Exception as e:
-                    logger.debug("Мост MAX->TG: fallback get_messages не сработал: %s", e)
-            import os
-            import tempfile
-            document_paths = []
-            temp_files = []
-            for att in all_attachments:
-                url = att.get("url") or ""
-                if not url or not url.startswith("http"):
-                    continue
-                # Первое изображение уйдёт как photo_url; остальные и все файлы — как документы
-                if url == image_url and att.get("type") in ("image", "photo"):
-                    continue
-                try:
-                    content, name = await download_attachment_max(
-                        url,
-                        att.get("type", ""),
-                        att.get("filename") or "",
-                    )
-                    if not content:
-                        continue
-                    ext = os.path.splitext(name)[1] if name and "." in name else ".bin"
-                    with tempfile.NamedTemporaryFile(delete=False, suffix=ext, prefix="max_bridge_") as tf:
-                        tf.write(content)
-                        document_paths.append(tf.name)
-                        temp_files.append(tf.name)
-                except Exception as e:
-                    logger.warning("Мост MAX->TG: скачивание вложения %s: %s", url[:50], e)
-            if not text and not image_url and not document_paths:
-                logger.debug("Мост MAX->TG: сбой %s — нет текста и нет вложений", alarm_id)
-                return
-            line = f"[MAX, {sender_name}]: {text}" if text else f"[MAX, {sender_name}]"
-            try:
-                from services.channel_service import ChannelService
-                svc = ChannelService()
-                await svc.send_to_scm_topic(
-                    _telegram_bot,
-                    scm_channel_id,
-                    scm_topic_id,
-                    line,
-                    photo_url=image_url,
-                    document_paths=document_paths if document_paths else None,
-                )
-                logger.info(
-                    "Мост MAX->TG: сбой %s, тема %s — отправлено (текст=%s, фото=%s, файлов=%s)",
-                    alarm_id, scm_topic_id, bool(text), bool(image_url), len(document_paths),
-                )
-            except Exception as e:
-                logger.warning("Мост MAX->TG: %s", e)
-            for f in temp_files:
-                try:
-                    if os.path.isfile(f):
-                        os.unlink(f)
-                except Exception:
-                    pass
-            return
-        logger.warning("Мост MAX->TG: чат %s не совпал ни с одним сбоем (max_chat_id: %s)", cid_str, [str(i.get("max_chat_id") or "") for i in bot_state.active_alarms.values()])
 
     async def _handle_direct_chat_message(event: MessageCreated):
         """Обработка сообщений в личном чате: сценарий «Сообщить», команды, остановить/продлить."""
@@ -1206,18 +1184,81 @@ def _register_handlers(dp):
             return
         text_lower = text.lower().strip()
 
+        # Сценарий "Управлять" -> "Продлить" -> "Другое время"
+        manage_sess = get_manage_session(uid) or {}
+        if manage_sess.get("step") == "stats_custom_wait":
+            if not is_max_admin(uid):
+                clear_manage_session(uid)
+                await _reply_and_track(event, uid, "❌ Команда доступна только админам.")
+                return
+            parsed = _parse_stats_date_range(text)
+            if not parsed:
+                await _reply_and_track(event, uid, "❌ Не понял диапазон. Формат: ДД.ММ.ГГГГ-ДД.ММ.ГГГГ")
+                return
+            from services.alarm_history_service import build_alarm_stats_report
+
+            start, end = parsed
+            report = build_alarm_stats_report(start=start, end=end)
+            clear_manage_session(uid)
+            await _reply_and_track(event, uid, report, main_menu())
+            return
+
+        if manage_sess.get("step") == "extend_custom_minutes":
+            item_id = (manage_sess.get("item_id") or "").strip()
+            item_type = (manage_sess.get("item_type") or "").strip()
+            if not item_id or item_type not in ("alarm", "maintenance"):
+                clear_manage_session(uid)
+                await _reply_and_track(event, uid, "❌ Сессия продления устарела. Начните заново.")
+                return
+            if text_lower in ("отмена", "назад", "back", "cancel"):
+                clear_manage_session(uid)
+                await _reply_and_track(event, uid, "🚫 Продление отменено.")
+                return
+            try:
+                minutes = int(text_lower)
+            except ValueError:
+                await _reply_and_track(event, uid, "❌ Введите целое число минут, например: 90")
+                return
+            if minutes <= 0 or minutes > 10080:
+                await _reply_and_track(event, uid, "❌ Укажите минуты от 1 до 10080 (неделя).")
+                return
+
+            async def reply_fn(txt):
+                await _reply_and_track(event, uid, txt)
+
+            if item_type == "alarm":
+                await extend_alarm(item_id, minutes, reply_fn)
+            else:
+                await extend_maintenance(item_id, minutes, reply_fn)
+            clear_manage_session(uid)
+            return
+
         # Сценарий «Сообщить»: сессия или команда «сообщить» (удаляем предыдущее сообщение бота, отправляем новое)
         async def _reply_fn(t: str, attachments=None):
             await _reply_and_track(event, uid, t, attachments)
         consumed = await handle_create_message(
-            event, _reply_fn, uid, text or "", telegram_bot=_telegram_bot
-        )
+            event, _reply_fn, uid, text or "")
         if consumed:
             return
         if not text:
             return
 
         # Список событий: текущие, список, события, сбои, работы
+        if text_lower in ("календарь", "📅 календарь"):
+            from services.calendar_digest_service import get_today_calendar_digest_text
+            text_cal = await get_today_calendar_digest_text()
+            await _reply_and_track(event, uid, text_cal, main_menu())
+            return
+
+        if text_lower in ("статистика", "📊 статистика", "stats"):
+            if not is_max_admin(uid):
+                await _reply_and_track(event, uid, "❌ Команда доступна только админам.", main_menu())
+                return
+            clear_session(uid)
+            set_manage_session(uid, "stats_period")
+            await _reply_and_track(event, uid, "📊 Выберите период:", stats_period_menu())
+            return
+
         if text_lower in ("текущие", "список", "события", "сбои", "работы", "📕 текущие события"):
             alarms_text, _ = get_active_events_text("alarms", 0, html=False)
             works_text, _ = get_active_events_text("maintenances", 0, html=False)
@@ -1238,15 +1279,12 @@ def _register_handlers(dp):
             item_id = m_stop.group(1).strip()
             async def reply_fn(txt):
                 await _reply_and_track(event, uid, txt)
-            if not _telegram_bot:
-                await _reply_and_track(event, uid, "❌ Сервис недоступен (нет связи с Telegram ботом).")
-                return
             from bot_state import bot_state
             if item_id in bot_state.active_alarms:
-                await stop_alarm(item_id, _telegram_bot, reply_fn)
+                await stop_alarm(item_id, reply_fn)
                 return
             if item_id in bot_state.active_maintenances:
-                await stop_maintenance(item_id, _telegram_bot, reply_fn)
+                await stop_maintenance(item_id, reply_fn)
                 return
             await _reply_and_track(event, uid, f"❌ Событие с ID «{item_id}» не найдено (ни сбой, ни работа).")
             return
@@ -1265,23 +1303,14 @@ def _register_handlers(dp):
                 return
             async def reply_fn(txt):
                 await _reply_and_track(event, uid, txt)
-            if not _telegram_bot:
-                await _reply_and_track(event, uid, "❌ Сервис недоступен (нет связи с Telegram ботом).")
-                return
             from bot_state import bot_state
             if item_id in bot_state.active_alarms:
-                await extend_alarm(item_id, minutes, _telegram_bot, reply_fn)
+                await extend_alarm(item_id, minutes, reply_fn)
                 return
             if item_id in bot_state.active_maintenances:
-                await extend_maintenance(item_id, minutes, _telegram_bot, reply_fn)
+                await extend_maintenance(item_id, minutes, reply_fn)
                 return
             await _reply_and_track(event, uid, f"❌ Событие с ID «{item_id}» не найдено.")
             return
 
-    @dp.message_created()
-    async def alarm_main_catch_all(event: MessageCreated):
-        """В ALARM_MAIN удаляем любые сообщения не от бота и не от админов (в т.ч. без текста)."""
-        if _is_alarm_main(event):
-            await _alarm_main_moderate(event)
-        return
 
